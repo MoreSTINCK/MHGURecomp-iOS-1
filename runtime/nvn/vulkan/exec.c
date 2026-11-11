@@ -25,7 +25,8 @@
 #endif
 
 #include "../../kernel.h"
-#include "../../touch.h"  // (the touch controls: the HUD out of the thumbs' way, where its moved parts are drawn)
+#include "../../touch.h"
+#include "../../hud_parts.h"  // (the touch controls: the HUD out of the thumbs' way, where its moved parts are drawn)
 #include "fsr.h"
 #include "hdr.h"
 #include "shaders.h"
@@ -43,33 +44,33 @@
 #define TARGET_DX (-250.0f)         // (x 1200 -> 950, from the right edge: left of the arts)
 
 // Decompiled from gu-native libmain.so @ 0x4d80e8: classifies a layer-103 status HUD quad into
-// TZ_CLOCK (3), TZ_BARS (4), TZ_GAUGES (5), or TZ_PARTY (6).
+// HP_CLOCK (3), HP_BARS (4), HP_GAUGES (5), or HP_PARTY (6).
 static int classify_status_hud_part(float x, float y) {
-    if (x < 98.0f && y < 100.0f && !(fabsf(x - 116.0f) <= 1.0f && fabsf(y - 116.0f) <= 1.0f)) return TZ_CLOCK;
-    if (y < 100.0f && x >= 104.0f && y >= 36.0f) return TZ_GAUGES;
-    if (x >= 98.0f && y < 36.0f) return TZ_BARS;
-    if (x < 420.0f && y >= 100.0f) return TZ_PARTY;
+    if (x < 98.0f && y < 100.0f && !(fabsf(x - 116.0f) <= 1.0f && fabsf(y - 116.0f) <= 1.0f)) return HP_CLOCK;
+    if (y < 100.0f && x >= 104.0f && y >= 36.0f) return HP_GAUGES;
+    if (x >= 98.0f && y < 36.0f) return HP_BARS;
+    if (x < 420.0f && y >= 100.0f) return HP_PARTY;
     static const float box[4][4] = {
-        {10.0f, 15.0f, 102.0f, 98.0f},   // TZ_CLOCK
-        {100.0f, 13.0f, 763.0f, 38.0f},  // TZ_BARS
-        {108.0f, 36.0f, 199.0f, 60.0f},  // TZ_GAUGES
-        {16.0f, 104.0f, 210.0f, 247.0f}  // TZ_PARTY
+        {10.0f, 15.0f, 102.0f, 98.0f},   // HP_CLOCK
+        {100.0f, 13.0f, 763.0f, 38.0f},  // HP_BARS
+        {108.0f, 36.0f, 199.0f, 60.0f},  // HP_GAUGES
+        {16.0f, 104.0f, 210.0f, 247.0f}  // HP_PARTY
     };
-    int best = TZ_CLOCK;
+    int best = HP_CLOCK;
     float best_d2 = 1e30f;
     for (int i = 0; i < 4; i++) {
         float dx = x < box[i][0] ? box[i][0] - x : x > box[i][2] ? x - box[i][2] : 0.0f;
         float dy = y < box[i][1] ? box[i][1] - y : y > box[i][3] ? y - box[i][3] : 0.0f;
         float d2 = dx * dx + dy * dy;
-        if (d2 < best_d2) best_d2 = d2, best = TZ_CLOCK + i;
+        if (d2 < best_d2) best_d2 = d2, best = HP_CLOCK + i;
     }
     return best;
 }
 
 static bool hud_any_custom(void) {
     if (g_touch_hud) return true;
-    for (int k = 0; k < TZ_COUNT; k++) {
-        if (g_pc_zone_dx[k] != 0.0f || g_pc_zone_dy[k] != 0.0f || g_pc_zone_scale[k] != 1.0f || g_pc_zone_hide[k] != 0)
+    for (int k = 0; k < HP_COUNT; k++) {
+        if (g_hud_dx[1][k] != 0.0f || g_hud_dy[1][k] != 0.0f || g_hud_k[1][k] != 1.0f || g_hud_hidden[1][k] != 0)
             return true;
     }
     return false;
@@ -3454,10 +3455,10 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                         // Touch controls (runtime/touch.cpp): the hunt's Hunter Arts panels (x 726..842, y 560..720: up
                         // to three rows) to the top right, the target camera's icons (x 1200, y < 100) left of them
                         if (hunt_hud && pos_x >= 700.0f && pos_x <= 900.0f && pos_y > 560.0f) {
-                            arts_part = true, hud_part = TZ_ARTS;
+                            arts_part = true, hud_part = HP_ARTS;
                             if (g_touch_hud) vanchor = V_TOP, arts_move = true;
                         } else if (hunt_hud && fabsf(pos_x - 1200.0f) < 1.0f && pos_y < 100.0f) {
-                            target_part = true, hud_part = TZ_TARGET;
+                            target_part = true, hud_part = HP_TARGET;
                             target_move = g_touch_hud != 0;
                         }
                     } else if (fabsf(pos_z - 103.0f) < 0.5f) {
@@ -3468,7 +3469,7 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                             if (hunt_hud && pos_x >= 940.0f && pos_y >= 70.0f && pos_y <= 370.0f) {
                                 anchor = ANCHOR_RIGHT;
                                 vanchor = V_TOP;
-                                hud_part = TZ_MAP;
+                                hud_part = HP_MAP;
                             } else {
                                 anchor = ANCHOR_LEFT;
                                 vanchor = V_TOP;
@@ -3490,7 +3491,7 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                         // 105.0: Minimap & Target Cam
                         anchor = ANCHOR_RIGHT;
                         vanchor = V_TOP;
-                        if (hunt_hud && !ui_meownster_pass && pos_x >= 900.0f && pos_y <= 400.0f) hud_part = TZ_MAP;
+                        if (hunt_hud && !ui_meownster_pass && pos_x >= 900.0f && pos_y <= 400.0f) hud_part = HP_MAP;
                     } else {
                         // General fallback for other layers
                         if (pos_x <= 430.0f) anchor = ANCHOR_LEFT;
@@ -3566,15 +3567,15 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                     else new_pos_y = 360.0f + (pos_y - 360.0f) * sy;
 
                     // Apply 8-piece HUD user offset (dx, dy), scale around pivot, and hide (Touch HUD or Controller HUD)
-                    if (hud_part >= 0 && hud_part < TZ_COUNT) {
-                        static const float hud_piv[TZ_COUNT][2] = {
+                    if (hud_part >= 0 && hud_part < HP_COUNT) {
+                        static const float hud_piv[HP_COUNT][2] = {
                             {1115.0f, 663.0f}, {833.0f, 663.0f}, {1200.0f, 56.0f}, {56.0f, 56.0f},
                             {431.0f, 25.0f},   {153.0f, 48.0f},  {113.0f, 175.0f}, {1114.0f, 225.0f}
                         };
-                        const volatile float *zdx = g_touch_hud ? g_touch_zone_dx : g_pc_zone_dx;
-                        const volatile float *zdy = g_touch_hud ? g_touch_zone_dy : g_pc_zone_dy;
-                        const volatile float *zsc = g_touch_hud ? g_touch_zone_scale : g_pc_zone_scale;
-                        const volatile int   *zhid = g_touch_hud ? g_touch_zone_hide : g_pc_zone_hide;
+                        const volatile float *zdx = g_touch_hud ? g_hud_dx[0] : g_hud_dx[1];
+                        const volatile float *zdy = g_touch_hud ? g_hud_dy[0] : g_hud_dy[1];
+                        const volatile float *zsc = g_touch_hud ? g_hud_k[0] : g_hud_k[1];
+                        const volatile int   *zhid = g_touch_hud ? g_hud_hidden[0] : g_hud_hidden[1];
                         float dx = zdx[hud_part], dy = zdy[hud_part], sc = zsc[hud_part];
                         if (sc <= 0.0f) sc = 1.0f;
                         if (dx != 0.0f || dy != 0.0f || sc != 1.0f) ui_relax_scissor = true;
