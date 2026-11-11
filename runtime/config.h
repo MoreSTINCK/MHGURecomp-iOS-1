@@ -10,38 +10,47 @@ extern "C" {
 
 enum { DISPLAY_WINDOWED, DISPLAY_FULLSCREEN, DISPLAY_BORDERLESS };
 enum { FACE_POSITION, FACE_LABEL };
-enum { COMBO_LENIENT, COMBO_STRICT };  // [Controls] ComboInputWindow (runtime/hle/combowin.c)
-enum { TOUCH_AUTO, TOUCH_ON, TOUCH_OFF };  // [Touch] Controls: the touch controls show with no controller (Auto), always, never
+enum { COMBO_LENIENT, COMBO_STRICT };
+enum { TOUCH_AUTO, TOUCH_ON, TOUCH_OFF };  // [Touch] Controls (runtime/touch.cpp)  // [Controls] ComboInputWindow (runtime/hle/combowin.c)
 enum { MENU_CONFIRM_ORIGINAL, MENU_CONFIRM_SOUTH, MENU_CONFIRM_EAST };
 enum { FXAA_ORIGINAL, FXAA_311 };  // [Anti-aliasing] FXAAMode (runtime/nvn/vulkan/exec.c)
 
 // [Keybinds]: the keyboard and mouse controls (runtime/host_input.c), in the file's order. Each takes up to two keys
 // or mouse buttons: an SDL scancode, KEY_MOUSE + SDL_BUTTON_*, or the wheel's KEY_WHEEL_UP / KEY_WHEEL_DOWN (0: none).
-// BIND_ITEM_LEFT / RIGHT turn the item bar directly (runtime/hle/itembar.c), not a Switch button.
+// BIND_CAM_* tilt the right stick all the way. BIND_ITEM_LEFT / RIGHT turn the item bar directly (runtime/hle/itembar.c),
+// not a Switch button. BIND_COMBO1.. press a combined button's buttons ([Touch] Combo1.., TOUCH_COMBOS of them).
 enum {
     BIND_MOVE_UP, BIND_MOVE_DOWN, BIND_MOVE_LEFT, BIND_MOVE_RIGHT, BIND_WALK,
+    BIND_CAM_UP, BIND_CAM_DOWN, BIND_CAM_LEFT, BIND_CAM_RIGHT,
     BIND_A, BIND_B, BIND_X, BIND_Y, BIND_L, BIND_R, BIND_ZL, BIND_ZR, BIND_PLUS, BIND_MINUS,
     BIND_DPAD_UP, BIND_DPAD_DOWN, BIND_DPAD_LEFT, BIND_DPAD_RIGHT, BIND_LSTICK, BIND_RSTICK,
-    BIND_ITEM_LEFT, BIND_ITEM_RIGHT, BINDS
+    BIND_ITEM_LEFT, BIND_ITEM_RIGHT,
+    BIND_COMBO1, BIND_COMBO2, BIND_COMBO3, BIND_COMBO4, BIND_COMBO5, BIND_COMBO6, BINDS
 };
 #define BIND_KEYS 2
 #define KEY_MOUSE 0x1000
 #define KEY_WHEEL_UP (KEY_MOUSE + 0x10)
 #define KEY_WHEEL_DOWN (KEY_MOUSE + 0x11)
 
-// The touch controls (runtime/touch.cpp): the game's buttons, for showing each on the screen or not ([Touch] Show*)
-enum { TB_ATTACKS, TB_DODGE, TB_GUARD, TB_SHEATHE, TB_PLUS, TB_MINUS, TB_DPAD, TB_L, TB_ZL, TB_ZR, TB_L3, TB_R3, TB_STICK,
-       TB_RANGED, TB_FIRE, TB_SECOND, TB_AIM, TB_RSPECIAL, TB_AMMO, TB_ITEM_ARROWS, TB_MENU_ZL, TB_MENU_ZR, TB_COUNT };
-#define TOUCH_SHOW_DEFAULT {1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0}
-#define TOUCH_COMBOS 6
-// A controller's buttons a combined button can be on (the less used ones): [Touch] Combo*Pad
-enum { PADB_NONE, PADB_L3, PADB_R3, PADB_MINUS, PADB_GUIDE, PADB_MISC, PADB_PADDLE1, PADB_PADDLE2, PADB_PADDLE3, PADB_PADDLE4,
-       PADB_TOUCHPAD, PADB_COUNT };
-
 // [Monster HP]: factors on the HP multiplier of Hub-type quests' large monsters
 #define HP_QUESTS_MAX 256
 #define HP_SCALE_MIN 0.05f
 #define HP_SCALE_MAX 20.0f
+// [Multiplayer] RecentServer<n> / RecentKey<n>: how many hub servers and matchmaking keys the menu remembers (the MH4U
+// port's lobbies too: RecentLobby<n>)
+#define LDN_RECENT 24
+// The game's buttons, for showing each on the screen or not ([Touch] Show*: runtime/touch.cpp); and two of the touch
+// controls' ways, kept with them: [Touch] StickRun (the stick pushed far out runs, locked; Off: a Run button instead) and
+// GuardSlide (a thumb from Guard keeps R as it slides onto the attacks)
+enum { TB_ATTACKS, TB_DODGE, TB_GUARD, TB_SHEATHE, TB_PLUS, TB_MINUS, TB_DPAD, TB_L, TB_ZL, TB_ZR, TB_L3, TB_R3, TB_STICK,
+       TB_RANGED, TB_FIRE, TB_SECOND, TB_AIM, TB_RSPECIAL, TB_AMMO, TB_ITEM_ARROWS, TB_MENU_ZL, TB_MENU_ZR, TB_MENU_PAD,
+       TB_STICK_RUN, TB_GUARD_SLIDE, TB_COUNT };
+// (the item bar's arrows on by default, as in the MH4U port)
+#define TOUCH_SHOW_DEFAULT {1, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 0}
+#define TOUCH_COMBOS 6
+// a controller's buttons a combined button can be on (the less used ones)
+enum { PADB_NONE, PADB_L3, PADB_R3, PADB_MINUS, PADB_GUIDE, PADB_MISC, PADB_PADDLE1, PADB_PADDLE2, PADB_PADDLE3, PADB_PADDLE4,
+       PADB_TOUCHPAD, PADB_COUNT };
 typedef struct {
     float scale[4];  // by the number of hunters (index: hunters - 1)
     float village;   // Village quests posted in the Hub / Pub: this first, then scale ([Village Quests] HubHP)
@@ -53,7 +62,7 @@ typedef struct {
     int display_mode;         // DISPLAY_*
     int width, height;        // screen / window size (Fullscreen: the monitor mode)
     int render_w, render_h;   // the game's 3D resolution (16:9)
-    int fps;                  // frame rate cap: 30..240
+    int fps;                  // frame rate cap: 30..240 (a desktop: up to FPS_UNLIMITED)
     int vsync;                // 1: present without tearing (mailbox / FIFO, at most the refresh rate), 0: immediate
     int msaa;                 // samples of the 3D scene: 1 (off), 2, 4, 8
     int fxaa;                 // the game's own FXAA pass: 1 on, 0 off
@@ -63,7 +72,6 @@ typedef struct {
     int sync_small_monsters;  // multiplayer: small monsters synced like large ones (runtime/net/emsync.c)
     int bonus_content;        // free downloads copied from a donor save into saves without any (runtime/services/bonus.c)
     int village_in_hub;       // L / R at the Hub's / Pub's quest counter switch to Village quests (runtime/hle/villagehub.c)
-    int share_urgent;         // an unlocked Urgent quest someone else posted counts when cleared (runtime/hle/urgentcredit.c)
     HpScale hp;               // large monster HP in Hub-type quests (runtime/hle/hpscale.c)
     float mouse_sensitivity;  // mouse look: times the hunt camera's angle per count (runtime/hle/mousecam.c), and
                               // the speed for full right stick tilt elsewhere is divided by it (runtime/host_input.c)
@@ -83,92 +91,114 @@ typedef struct {
     int fsr_objmotion;        // FSR: motion vectors of moving objects (characters, monsters): 1 on, 0 camera only
     float fsr_reactive;       // FSR: reactive mask strength on the game's moving-object mask, 0 (off) .. 1
     int fsr_animsurf;         // FSR: surfaces animated through their texture (banners, water): 1 detected, 0 off
-    int updates;              // [Application] Updates: UPDATES_*, read by the updater (updater/updater.c), not the game
+    int fsr_upscaler;         // [Upscaler] Upscaler: FSR_UP_3 (FSR 3.1), FSR_UP_4 (FSR 4, runtime/nvn/vulkan/fsr4.c) or
+                              // FSR_UP_XESS (XeSS-SR, Windows: runtime/nvn/vulkan/xess.c)
+    int updates;              // [Application] Updates: UPDATES_*: Android's start looks for a newer release once a day (Notices.java)
     int shader_prewarm;       // [Performance] ShaderPrewarm: translate the game's shaders at start-up (nvn/vulkan/exec.c)
-    int loading_indicator;    // [Performance] LoadingIndicator: the start-up's "Loading" corner (overlay.cpp); ini only
     float draw_distance;      // [Graphics] DrawDistance: town NPCs' fade distance factor, 0 no limit (config.c npc_fade_dist2)
     int mute_in_background;   // [Audio] MuteInBackground: no sound while the window is not focused (config_audio_gain)
     int combo_window;         // [Controls] ComboInputWindow: COMBO_*, how long a press waits for a second button
-    // [Touch]: the on-screen controls (runtime/touch.cpp: phones and tablets; see docs/touch.md)
-    int touch_controls;       // [Touch] Controls: TOUCH_*, on the screen with no controller (Auto), always, never
-    int touch_hud;            // [Touch] MoveHUD: the game's HUD moves out of the thumbs' way while they show (nvn/vulkan/exec.c)
-    float touch_camera;       // [Touch] CameraSpeed: the camera's turn for a drag (1: about 90 degrees a screen height)
-    float touch_opacity;      // [Touch] Opacity: of the controls, 0.2 .. 1
-    int touch_vibration;      // [Touch] Vibration: a short tick when a touch control is pressed (runtime/haptics.c)
-    int lock_on;              // [Controls] LockOn: the camera stays on the monster, and with it a bow's or gun's shots
-    int touch_show[TB_COUNT]; // [Touch] Show*: which of the game's buttons are on the screen (runtime/touch.cpp)
-    char touch_combo[TOUCH_COMBOS][32];  // [Touch] Combo1..: the game's buttons one screen button presses together
-                                         // ("A+X"; config_combo_mask); "" none
-    int touch_combo_pad[TOUCH_COMBOS];   // [Touch] Combo1Pad..: PADB_*, a controller's button that does the same
     char ldn_server[256];     // [Multiplayer] Server: hub server for internet hubs (host[:port]); "" the default, "Off" none
     char ldn_key[64];         // [Multiplayer] Key: matchmaking key, hubs seen only by players with the same; "" public
     char chat_key[32];        // [Controls] ChatKey: the key that opens a line of chat (runtime/hle/chat.c), by SDL's
                               // name for it ("/", "Y"...); "" none
     int fxaa_mode;            // [Anti-aliasing] FXAAMode: FXAA_*, which FXAA draws while FXAA is on
     int smooth_gradients;     // [Graphics] SmoothGradients: the game's RGBA8 render targets as RGBA16 (nvn/vulkan/textures.c)
-    int fix_kerning;          // [Graphics] FixKerning: UI text at exact places, even margins, kerning (hle/textlayout.c)
-    int bold_text;            // [Graphics] BoldText: UI letters stretched by the texture inset, as the game draws them
-                              // (default on on Android, off elsewhere)
-    int hdr;                  // [HDR] HDR: HDR10 / scRGB output on an HDR display (nvn/vulkan/hdr.c), 0 SDR
-    float hdr_peak;           // [HDR] PeakBrightness: the display's peak, nits
-    float hdr_game;           // [HDR] GameBrightness: the 3D picture's white (SDR 100%), nits
-    float hdr_ui;             // [HDR] UIBrightness: HUD, menus, text and the settings menu, nits
-    int hdr_tonemap;          // [HDR] ToneMapper: HDR_TONEMAP_*
-    int hdr_gamma;            // [HDR] GammaCorrection: HDR_GAMMA_* (as RenoDX: Off, 2.2, BT.1886 = 2.4)
-    float hdr_exposure;       // [HDR] Exposure: 0 .. 2, 1 = the game's
-    float hdr_highlights;     // [HDR] Highlights, Shadows, Contrast, Saturation, HighlightSaturation: 0 .. 100, 50 = the
-    float hdr_shadows;        //       game's (RenoDX's colour grading sliders)
-    float hdr_contrast;
-    float hdr_saturation;
-    float hdr_highlight_saturation;
-    float hdr_flare;          // [HDR] Flare: 0 .. 100, 0 = none
-    float hdr_bloom;          // [HDR] Bloom: the game's bloom strength, 0 .. 100 %
-    int hdr_scene;            // [HDR] UnclampedScene: the render-size scene targets as RGBA16F too (not only the post chain)
-    int hdr_format;           // [HDR] HDRFormat: HDR_FORMAT_*, the window image's format (ini only)
-    int hdr_analysis;         // [HDR] Analysis: the HDR analysis overlay (nvn/vulkan/hdr.c, overlay.cpp)
     int binds[BINDS][BIND_KEYS];  // [Keybinds]: BIND_* -> its keys (an SDL scancode or KEY_MOUSE + button; 0 none)
     int menu_theme;           // [Application] Theme: THEME_*, the settings menu's colours (runtime/settings_panel.cpp)
     int discord;              // [Discord] RichPresence: what you play, on your Discord profile (runtime/net/discord.c)
     int discord_hunter;       // [Discord] ShowHunter: your hunter's name and HR there too (runtime/hle/presence.c)
-    int show_fps;             // [Performance] ShowFPS: the frame rate in a box on the screen (runtime/overlay.cpp)
-    int menu_chord;           // [Controls] MenuChord: Plus + Minus together open the settings menu (runtime/host_input.c)
-    int show_battery;         // [Performance] ShowBattery: BATTERY_*, the battery's charge beside the frame rate or alone
-    char save_location[256];  // [Application] SaveLocation (PC): the folder holding the save (save_0/), "" the default
-                              // (%APPDATA%\MHGURecomp\save, ~/.local/share/MHGURecomp/save: main.c)
-    char save_dir[256];       // [Android] SaveFolder: the folder holding the save (save_0/), "" the app's own (fs.c)
-    char game_dir[256];       // [Android] GameFolder: the folder holding exefs/ and romfs/, "" the app's own (main.c)
-    char ldn_ryu_servers[256]; // [Multiplayer] RyuServers: Ryujinx LDN servers searched for crossplay (host[:port], comma separated); "" none
-    char ldn_ryu_host[128];   // [Multiplayer] RyuHost: the Ryujinx LDN server a hosted hub is created on, for Ryujinx players to join; "" a normal hub
-    char ldn_ryu_pass[40];    // [Multiplayer] RyuPassphrase: "" public lobbies, or "Ryujinx-" + 8 hex digits for a private group
-    char ldn_room_server[128]; // [Multiplayer] RoomServer: a suyu-family emulator room joined for crossplay (host[:port]); "" none
-    char ldn_room_pass[64];   // [Multiplayer] RoomPassword
-    char ldn_room_nick[32];   // [Multiplayer] RoomName: the name shown in the room; "" MHGU Player
-    int ldn_room_host;        // [Multiplayer] RoomHost: a hub you create lives in the room, for emulator players to join
-    int ldn_ryu_serve;        // [Multiplayer] RyuServe: this game runs the Ryujinx LDN server itself (runtime/net/ryusrv/) while local play is open
-    int ldn_ryu_serve_port;   // [Multiplayer] RyuServePort: its port; 0 = 30456, the LdnServer default
-    int ldn_room_serve;       // [Multiplayer] RoomServe: this game runs a suyu-style room itself (runtime/net/roomsrv.c): the pseudo room for suyu-family players
-    int ldn_room_serve_port;  // [Multiplayer] RoomServePort: its port; 0 = 24872, the rooms' default
-    // ---- APK 设置面板（gu-native settings_panel.cpp）需要、iOS 侧暂未生效的项 ----
-    // 先让面板原样编译/显示；对应功能（陀螺仪、鼠标菜单、草地/阴影/混响、手机震动等）
-    // 在 iOS 没有实现通路，改了不会有效果，后续按需接上或从面板删掉。
-    int fill_screen, grass, shadows, reverb;
-    int show_stats;          // 0 关 / 1 简 / 2 全（APK 的 stats 选项）
-    int gyro_aim; float gyro_sensitivity;
-    int mouse_menus, phone_rumble, pause_background, pause_menu;
+    int fill_screen;          // [Display] FillScreen: movies and menu backdrops cover a wider screen (nvn/vulkan/exec.c)
+    int touch_controls;       // [Touch] Controls: TOUCH_*, the controls on the screen (runtime/touch.cpp)
+    int touch_hud;            // [Touch] MoveHUD: the HUD moves out of the thumbs' way while they show (nvn/vulkan/exec.c)
+    float touch_camera;       // [Touch] CameraSpeed: the camera's turn for a drag (1: about 90 degrees a screen height)
+    float touch_opacity;      // [Touch] Opacity: of the controls, 0.2 .. 1
+    int render_scale;         // [Display] RenderScale: RenderResolution Auto's 3D size, percent of the screen's (25..100)
+    int touch_vibration;      // [Touch] Vibration: a short tick when a touch control is pressed (runtime/haptics.c)
+    int phone_rumble;         // [Controls] PhoneRumble: the game's rumble on the phone's vibrator too (runtime/haptics.c)
+    int show_stats;           // [Performance] ShowStats: the frame rate and the phone's temperature on screen (perfstats);
+                              // a desktop: 0 off, 1 (On, the menu's Basic) with the GPU's temperature, 2 (Full) also
+                              // the GPU's and the CPU's lines
+    int pause_background;     // [Application] PauseInBackground: the game stops while the app is in the background
+    int low_end;              // [Performance] LowEnd: 0 off, 1 a weak GPU's frame, 2 Toaster (LOW_END_TOASTER: all of it and more)
+    int lock_on;              // [Controls] LockOn: the camera stays on the monster, and with it a bow's or gun's shots (touch.cpp)
+    // (every field's default is in config.c's CONFIG_DEFAULT_VALUES, by position: a new field needs one there)
+    int shadows;              // [Performance] Shadows: 0 none drawn (nvn/vulkan/exec.c shadow_skipped)
+    int adreno_fix;           // [Performance] AdrenoFix: 0 Auto, 1 Off (nvn/vulkan/device.c msaa_floor)
+    int bloom;                // [Performance] Bloom: 0 the bloom and depth of field chain is left out (nvn/vulkan/exec.c lowend_skipped)
+    int reverb;               // [Audio] Reverb: 0 the game's reverb effects let the sound through dry (services/audio.c)
+    int touch_show[TB_COUNT]; // [Touch] Show*: which of the game's buttons are on the screen in a hunt (runtime/touch.cpp)
+    int thanks_shown;         // [Application] ThanksShown: the thank-you shown once, after the credits of the first start,
+                              // was closed (settings_panel.cpp draw_thanks); from then on only Credits & Licenses shows it
+    char touch_combo[TOUCH_COMBOS][32];  // [Touch] Combo1..: the game's buttons one screen button presses together
+                                         // ("A+X"; config_combo_mask); "" none
+    int touch_combo_pad[TOUCH_COMBOS];   // [Touch] Combo1Pad..: PADB_*, a controller's button that does the same
+    char gpu[256];            // [Display] GPU: the Vulkan device's name (nvn/vulkan/device.c pick_device); "Auto" or "" the
+                              // best one (MHGU_GPU=<index> overrides)
+    int menu_hint_seen;       // [Application] MenuHintSeen (a desktop): the settings menu was opened once, so the notice
+                              // at the start that says how (overlay.cpp menu_hint) no longer shows
+    int mouse_menus;          // [Controls] MouseMenus (a desktop): in the game's menus the mouse points and clicks
+                              // (runtime/hle/mousemenu.c, host_input.c); off, it turns the camera there as elsewhere
+    int grass;                // [Performance] Grass: 0 the game's grass fields (its uGrass2 units) are not drawn
+                              // (runtime/hle/grass.c; the Marshland's area 8 slowed weak phones down: #85, #121, #159)
+    int lock_buttons;         // [Touch] LockOnButtons: L and the target button were shown once for the lock-on (its
+                              // padlock and long press are L's, the target button changes its monster: touch.cpp); a
+                              // file without it (0.1.8 and before, both off by default) gets both shown (config.c)
+    int online_notice;        // [Multiplayer] OnlineNoticeShown: the notice about playing online (which server, and that it
+                              // sees the player's IP address) was closed; until then nothing reaches a hub server
+                              // (runtime/net/ldn.c, settings_panel.cpp's card)
+    int pause_menu;           // [Application] PauseInMenu (Android): the game waits while the settings menu is open and the
+                              // player plays alone (runtime/overlay.cpp; #94)
+    char ldn_recent_server[LDN_RECENT][256];  // [Multiplayer] RecentServer1..: the hub servers typed and saved, the last
+                                              // first, none of the short list's (the menu's list: settings_panel.cpp)
+    char ldn_recent_key[LDN_RECENT][64];      // [Multiplayer] RecentKey1..: the matchmaking keys typed and saved, the same
+    int gyro_aim;             // [Controls] GyroAim: aiming a bow or a bowgun, turning the phone (or a controller with a gyro)
+                              // turns the aim too, from where it was as the aim began (runtime/host_input.c gyro_update)
+    float gyro_sensitivity;   // [Controls] GyroSensitivity: the aim's turn for a turn of the phone (GYRO_SENS_MIN..MAX)
+    // ---- iOS 宿主专用字段（APK 的 Config 没有）----
+    char game_dir[512];
+    char save_dir[512];
+    char save_location[512];
+    int  height;
+    int  loading_indicator;
+    char ldn_room_host[256], ldn_room_nick[64], ldn_room_pass[64], ldn_room_server[256];
+    int  ldn_room_serve, ldn_room_serve_port;
+    char ldn_ryu_host[256], ldn_ryu_pass[64], ldn_ryu_servers[256];
+    int  ldn_ryu_serve, ldn_ryu_serve_port;
 } Config;
-// The hub server used when ini Server is empty (runtime/net/ldn.c, server/): the project's public one (an Oracle
-// Cloud VM; a DuckDNS name, so it can move without a release). "" = no default.
-// Note: the below server address should ideally only be used by MHGURecomp, or any forks that intend to be fully network-compatible with it.
-// If you are going to use the below server address on Android or iOS (mobile), please ensure that the "default" matchmaking key for public play is passed as `public-phone` and not empty.
-// This is to ensure gameplay remains stable on PC, while still allowing players to opt into crossplay by specifying a matchmaking key themselves.
-#define LDN_DEFAULT_SERVER "morerokk-mhgurecomp-ldnserver.duckdns.org"
-enum { UPDATES_ASK, UPDATES_AUTO, UPDATES_OFF };
-enum { HDR_GAMMA_OFF, HDR_GAMMA_22, HDR_GAMMA_24 };                   // [HDR] GammaCorrection
-enum { HDR_TONEMAP_VANILLA, HDR_TONEMAP_NONE, HDR_TONEMAP_RENODRT };  // [HDR] ToneMapper
-enum { HDR_FORMAT_AUTO, HDR_FORMAT_HDR10, HDR_FORMAT_SCRGB };  // [HDR] HDRFormat
-enum { BATTERY_OFF, BATTERY_WITH_FPS, BATTERY_ALONE };
+// The remembered lists (Config's ldn_recent_*: n entries of `width` bytes, the last first, no empty one between): add puts
+// a value at the front once (nocase: compared as host names are; an empty one is nothing), the last one dropped when it
+// is full; remove takes it out, the rest moving up (false: it wasn't there)
+void config_recent_add(char *list, int n, size_t width, const char *value, bool nocase);
+bool config_recent_remove(char *list, int n, size_t width, const char *value, bool nocase);
+uint32_t config_combo_mask(const char *text);  // "A+X" -> the BTN_* bits, 0 if there is nothing or anything else in it
+void config_combo_text(uint32_t mask, char *out, size_t size);  // and back
+// The hub server used when ini Server is empty (runtime/net/ldn.c, server/): a community server that speaks this port's
+// protocol (PROTO_VERSION 2, LOBBY_PROTO 1), where players of 0.1.6 and later already meet. The project runs none.
+// LDN_SERVERS: the menu's short list, the default first ("Custom..." types any other, Off is none).
+#define LDN_DEFAULT_SERVER "hunterhubid-gu-hub.duckdns.org"
+#define LDN_SERVERS {LDN_DEFAULT_SERVER}
+#define LOW_END_SCALE 40  // what the menu's Low-end mode sets: RenderScale, FPS
+#define LOW_END_FPS 30
+// [Performance] FPS: the most a phone takes; a desktop also takes more, up to FPS_UNLIMITED ("Unlimited" in the file
+// and the menu: as many frames as the PC draws, the engine's limiter at 1 ms a frame, which no frame here is faster than)
+#define FPS_PHONE_MAX 240
+#define FPS_UNLIMITED 1000
+#ifdef __ANDROID__
+#define FPS_MAX FPS_PHONE_MAX
+#else
+#define FPS_MAX FPS_UNLIMITED
+#endif
+#define LOW_END_TOASTER 2   // LowEnd = Toaster: everything for speed and the battery (config.c, textures.c, the menu)
+#define TOASTER_SCALE 25    // what the menu's Toaster sets: RenderScale (and LOW_END_FPS)
+#define TOASTER_HUD_LINES 540  // Toaster: the HUD's picture at most this tall (config.c, fsr.c's output)
+// (a desktop) how tall the menu's Low-end mode and Toaster make the 3D picture, whatever the screen: config_lowend_scale
+#define LOW_END_LINES 720
+#define TOASTER_LINES 540
+enum { UPDATES_OFF, UPDATES_ON };  // (an older file's Ask and Auto: On; Never: Off)
 enum { THEME_GOLD, THEME_BLUE, THEME_HUNTER };  // [Application] Theme
 enum { UI_CENTER = 1, UI_21_9, UI_32_9, UI_EDGES };  // the middle 16:9, 21:9, 32:9, the picture's sides
+enum { FSR_UP_3, FSR_UP_4, FSR_UP_XESS };  // [Upscaler] Upscaler (a start-up setting: the device is made for it)
 enum { FSR_NATIVE, FSR_QUALITY, FSR_BALANCED, FSR_PERFORMANCE, FSR_ULTRA_PERFORMANCE };  // output / render: 1, 1.5, 1.7, 2, 3
 
 extern Config g_config;
@@ -179,10 +209,16 @@ extern uint32_t g_ui_size[2];      // the game's 2D canvas size (tools/gen.py PA
 extern float g_ui_anchor_aspect;   // the HUD's width / height, 16:9 .. g_render_aspect (nvn/vulkan/exec.c)
 extern uint32_t g_fsr_output[2];   // FSR on: the size it upscales to (what g_render_size would be without it), else 0
 extern float g_fsr_lod_bias;       // FSR on: texture LOD bias for the lower render size, log2(render / output); else 0
+extern const char *g_fsr4_fallback;  // Upscaler = FSR4 but FSR 3.1 runs: why, for the settings panel (nvn/vulkan/fsr4.c); else NULL
+extern const char *g_xess_fallback;  // Upscaler = XeSS but FSR 3.1 runs: why, for the settings panel (nvn/vulkan/xess.c); else NULL
 float camera_fovy(float fovy, float aspect);  // a 3D camera's vertical field of view for its aspect (gen.py PATCHES)
-float camera_aspect(float aspect);            // a 3D camera's aspect: the screen's, a preview's 16:9 shape (gen.py PATCHES)
-extern volatile float g_preview_box_aspect[4];  // model preview boxes drawn lately: shape (render pixels), when; and when
-extern volatile uint64_t g_preview_box_present[4], g_preview_cam_present;  // a camera got its 16:9 shape (camera_aspect)
+// (a desktop) the window's new size in pixels: with AspectRatio = Auto the picture takes its shape at once (config.c)
+void config_window_shape(int w, int h);
+#ifndef __ANDROID__
+// (a desktop) the RenderScale the menu's Low-end mode (1) or Toaster (LOW_END_TOASTER) sets for these settings: the 3D
+// picture LOW_END_LINES or TOASTER_LINES tall on the screen it is fitted to (config.c)
+int config_lowend_scale(const Config *c, int mode);
+#endif
 
 void config_load(void);  // before the window and the guest start
 void config_path(char *buf, size_t size);  // the settings file (MHGU_CONFIG, else mhgurecomp.ini)
@@ -237,62 +273,41 @@ int config_live_face_buttons(void);
 int config_live_menu_confirm(void);
 int config_live_background_input(void);
 int config_live_combo_window(void);
-// [Touch]: the touch controls read these every frame (runtime/touch.cpp)
-int config_live_touch_controls(void);
+int config_live_chat_key(void);  // [Controls] ChatKey as an SDL scancode (0: none)
+int config_live_bind(int bind, int slot);  // [Keybinds]: one of BIND_*'s keys (Config.binds)
+int config_live_fxaa_mode(void);
+int config_live_smooth_gradients(void);
+int config_live_discord(void);         // [Discord] RichPresence
+int config_live_discord_hunter(void);  // [Discord] ShowHunter
+int config_live_touch_controls(void);  // [Touch] (runtime/touch.cpp)
 int config_live_touch_hud(void);
+int config_live_lock_on(void);
+int config_live_gyro_aim(void);           // [Controls] GyroAim
+float config_live_gyro_sensitivity(void); // [Controls] GyroSensitivity
+int config_live_mouse_menus(void);  // [Controls] MouseMenus (a desktop's; 0 on a phone)
 int config_live_touch_show(int button);        // TB_*
 uint32_t config_live_touch_combo(int index);   // its buttons (config_combo_mask)
 int config_live_touch_combo_pad(int index);    // PADB_*
 float config_live_touch_camera(void);
 float config_live_touch_opacity(void);
-int config_live_touch_vibration(void);
-int config_live_lock_on(void);                 // [Controls] LockOn
-uint32_t config_combo_mask(const char *text);  // "A+X" -> the BTN_* bits, 0 if there is nothing or anything else in it
-void config_combo_text(uint32_t mask, char *out, size_t size);  // and back
-int config_live_chat_key(void);  // [Controls] ChatKey as an SDL scancode (0: none)
-int config_live_bind(int bind, int slot);  // [Keybinds]: one of BIND_*'s keys (Config.binds)
-int config_live_fxaa_mode(void);
-int config_live_smooth_gradients(void);
-int config_live_fix_kerning(void);  // [Graphics] FixKerning, read as each text is set (game threads)
-int config_live_bold_text(void);    // [Graphics] BoldText, read as each glyph is drawn (game threads)
-int config_live_hdr(void);                // [HDR] HDR (nvn/vulkan/device.c: the window image is made again when it changes)
-int config_live_hdr_format(void);         // [HDR] HDRFormat
-float config_live_hdr_peak(void);         // [HDR] PeakBrightness, GameBrightness, UIBrightness (nits) and the tone mapping /
-float config_live_hdr_game(void);         // grading settings: read every frame (nvn/vulkan/hdr.c)
-float config_live_hdr_ui(void);
-int config_live_hdr_tonemap(void);
-int config_live_hdr_gamma(void);
-int config_live_hdr_scene(void);
-int config_live_hdr_analysis(void);
-float config_live_hdr_exposure(void);
-float config_live_hdr_highlights(void);
-float config_live_hdr_shadows(void);
-float config_live_hdr_contrast(void);
-float config_live_hdr_saturation(void);
-float config_live_hdr_highlight_saturation(void);
-float config_live_hdr_flare(void);
-float config_live_hdr_bloom(void);
-float config_live_fsr_sharpness(void);  // [Upscaler] Sharpness, read by each FSR dispatch (nvn/vulkan/fsr.c)
-float config_live_fsr_reactive(void);   // [Upscaler] Reactive, read by each FSR frame (nvn/vulkan/fsr.c)
-void config_live_hp(HpScale *out);      // [Monster HP] and [Village Quests] HubHP as saved now (hle/hpscale.c)
-float config_live_hp_village(void);     // [Village Quests] HubHP as saved now
-int config_live_village_in_hub(void);   // [Village Quests] VillageQuestsInHub (hle/villagehub.c)
-int config_live_ldn_port(void);         // [Multiplayer] Port: the next hub hosted and the next search (net/ldn.c)
-void config_live_ldn_join(char *join, size_t size);  // [Multiplayer] Join: the next search (net/ldn.c)
-int config_live_sync_small_monsters(void);  // [Multiplayer] SyncSmallMonsters (net/emsync.c)
-int config_live_bonus_content(void);    // [Bonus Content] BonusContent: each time the game opens a save (services/bonus.c)
-int config_live_discord(void);         // [Discord] RichPresence
-int config_live_discord_hunter(void);  // [Discord] ShowHunter
-int config_live_share_urgent(void);    // [Multiplayer] ShareUrgentCredit
+int config_live_touch_vibration(void);  // [Touch] Vibration
+int config_live_phone_rumble(void);     // [Controls] PhoneRumble
+int config_live_show_stats(void);       // [Performance] ShowStats
+int config_live_generation(void);      // counts the live settings' publishes (runtime/touch.cpp: a frame's key)
+int config_live_pause_background(void); // [Application] PauseInBackground
+int config_live_pause_menu(void);       // [Application] PauseInMenu
+int config_live_shadows(void);          // [Performance] Shadows
+int config_live_bloom(void);            // [Performance] Bloom
+int config_live_grass(void);            // [Performance] Grass
+int config_live_reverb(void);           // [Audio] Reverb
+void config_live_test(const Config *c);  // (config.c: a test run's overrides of Shadows, Bloom, Grass, FPS; not saved)
 void config_live_ldn(char *server, size_t server_size, char *key, size_t key_size);  // [Multiplayer] Server, Key
+int config_live_online_notice(void);  // [Multiplayer] OnlineNoticeShown
 bool config_restart_required(const Config *draft); // Raw cold fields vs this process's startup INI values.
 float config_audio_gain(void);  // atomic, safe on audio threads; 0 while muted in the background
 void config_window_focus(bool focused);  // the window got / lost the focus (runtime/host_input.c)
 int config_language(void);     // last saved UI language, atomic across host threads
 bool config_confirm_exit(void); // atomic, safe on the host main thread
-bool config_menu_chord(void);   // [Controls] MenuChord as saved, atomic (the input is read on another thread)
-int config_show_battery(void);  // [Performance] ShowBattery as saved, atomic
-bool config_show_fps(void);     // [Performance] ShowFPS as saved, atomic (the game's thread draws it)
 
 #ifdef __cplusplus
 }
