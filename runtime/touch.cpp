@@ -637,7 +637,9 @@ struct Finger {
 struct Pulse {
     uint64_t buttons, from, until;  // (held from .. until: a sequence starts some later)
 };
-enum { E_SMALLER, E_BIGGER, E_HIDE, E_SET, E_STYLE, E_HUD, E_RESET, E_CANCEL, E_SAVE, E_COUNT };
+// 与 APK（khorne-hub/gu-native）的编辑器面板同一套按钮、同一顺序
+enum { E_SMALLER, E_BIGGER, E_HIDE, E_RESET, E_SET, E_STYLE, E_HUD, E_DEFAULTS, E_CANCEL, E_SAVE, E_COUNT };
+const int SEL_PANEL = -2;   // s.sel：面板被选中（拖它的标题条移动、捏合或 -/+ 改大小）
 struct State {
     Finger f[10];
     bool stick_on;
@@ -789,11 +791,43 @@ void to_menu(const SDL_Event *e) {
 
 // ---- the layout editor: a panel at the top (smaller, bigger, defaults, cancel, save); drag a control to move it,
 // pinch (a second finger anywhere) or the panel's - / + to size it
-void editor_panel(float w, float h, Rect *panel, Rect btn[E_COUNT]) {
-    float pw = std::min(w * .9f, 1.8f * h), ph = .2f * h, x0 = (w - pw) * .5f, y0 = (h - ph) * .4f;
+// 面板：位置/大小（EPANEL_MIN..100%），标题条可拖、两端有抓手；两行按钮，和 APK 一样
+struct EditPanel { float x = -1.0f, y = -1.0f, k = 1.0f; };
+static EditPanel g_epanel;
+const float EPANEL_MIN = .6f;
+void panel_dims(float w, float h, float k, float *pw, float *ph) { *pw = std::min(w * .94f, 1.9f * h) * k, *ph = .28f * h * k; }
+float editor_panel(const EditPanel &ep, float w, float h, Rect *panel, Rect btn[E_COUNT], Rect *grab = nullptr) {
+    float k = std::clamp(ep.k, EPANEL_MIN, 1.0f), u = k * h, pw, ph;
+    panel_dims(w, h, k, &pw, &ph);
+    float x0 = ep.x < 0 ? (w - pw) * .5f : ep.x * w - pw * .5f, y0 = ep.y < 0 ? (h - ph) * .4f : ep.y * h - ph * .5f;
+    x0 = std::clamp(x0, 0.0f, std::max(0.0f, w - pw)), y0 = std::clamp(y0, 0.0f, std::max(0.0f, h - ph));
     *panel = {x0, y0, x0 + pw, y0 + ph, true};
-    float gap = .015f * h, bw = (pw - gap * (E_COUNT + 1)) / E_COUNT, by0 = y0 + ph * .5f, by1 = y0 + ph - gap;
-    for (int i = 0; i < E_COUNT; i++) btn[i] = {x0 + gap + i * (bw + gap), by0, x0 + gap + i * (bw + gap) + bw, by1, true};
+    float gap = .012f * u, bh = .082f * u, r1 = y0 + .1f * u, r2 = r1 + bh + gap, bw = (pw - gap * 5) / 4;
+    if (grab) *grab = {x0, y0, x0 + pw, r1 - gap * .5f, true};
+    for (int i = 0; i < 4; i++) btn[i] = {x0 + gap + i * (bw + gap), r1, x0 + gap + i * (bw + gap) + bw, r1 + bh, true};
+    int n = E_COUNT - 4;
+    bw = (pw - gap * (n + 1)) / n;
+    for (int i = 4; i < E_COUNT; i++) {
+        int j = i - 4;
+        btn[i] = {x0 + gap + j * (bw + gap), r2, x0 + gap + j * (bw + gap) + bw, r2 + bh, true};
+    }
+    return u;
+}
+void panel_move(float dx, float dy, float w, float h) {
+    Rect p, b[E_COUNT];
+    editor_panel(g_epanel, w, h, &p, b);
+    float hw = (p.x1 - p.x0) * .5f, hh = (p.y1 - p.y0) * .5f;
+    g_epanel.x = std::clamp((p.x0 + p.x1) * .5f + dx, hw, std::max(hw, w - hw)) / w;
+    g_epanel.y = std::clamp((p.y0 + p.y1) * .5f + dy, hh, std::max(hh, h - hh)) / h;
+}
+void panel_resize(float to, float ax, float ay, float w, float h) {
+    Rect p, b[E_COUNT];
+    editor_panel(g_epanel, w, h, &p, b);
+    float fx = (ax - p.x0) / std::max(1.0f, p.x1 - p.x0), fy = (ay - p.y0) / std::max(1.0f, p.y1 - p.y0), pw, ph;
+    g_epanel.k = std::clamp(roundf(to * 100.0f) / 100.0f, EPANEL_MIN, 1.0f);
+    panel_dims(w, h, g_epanel.k, &pw, &ph);
+    g_epanel.x = (ax + (.5f - fx) * pw) / w, g_epanel.y = (ay + (.5f - fy) * ph) / h;
+    panel_move(0, 0, w, h);
 }
 
 void edit_begin(State &s) {
@@ -843,14 +877,16 @@ void edit_event(State &s, const SDL_Event *e, float x, float y) {
         if (!f) return;
         *f = {};
         f->id = e->tfinger.fingerID, f->x = f->x0 = x, f->y = f->y0 = y, f->ctl = -1;
-        Rect panel, btn[E_COUNT];
-        editor_panel(s.w, s.h, &panel, btn);
+        Rect panel, btn[E_COUNT], grab;
+        editor_panel(g_epanel, s.w, s.h, &panel, btn, &grab);
         for (int i = 0; i < E_COUNT; i++)
             if (btn[i].in(x, y)) {
                 f->kind = F_MENU;
                 if (i == E_SMALLER || i == E_BIGGER) {
                     float delta = i == E_BIGGER ? .1f : -.1f;
-                    if (s.sel >= 0 && s.sel < C_COUNT) {
+                    if (s.sel == SEL_PANEL) {
+                        panel_resize(g_epanel.k + delta, (btn[i].x0 + btn[i].x1) * .5f, (btn[i].y0 + btn[i].y1) * .5f, s.w, s.h);
+                    } else if (s.sel >= 0 && s.sel < C_COUNT) {
                         s.layout.scale[s.sel] += delta, clamp_place(s, s.sel);
                     } else if (s.sel >= ZONE_SEL && s.sel < ZONE_SEL + TZ_COUNT) {
                         int k = s.sel - ZONE_SEL;
@@ -874,7 +910,19 @@ void edit_event(State &s, const SDL_Event *e, float x, float y) {
                 } else if (i == E_HUD) {
                     s.hud_mode = 1 - s.hud_mode;
                     if (s.hud_mode == 1 && s.sel >= 0 && s.sel < C_COUNT) s.sel = -1;
-                } else if (i == E_RESET) {
+                } else if (i == E_RESET) {  // 与 APK 相同：复位“当前选中”的那一个
+                    if (s.sel == SEL_PANEL) {
+                        g_epanel = EditPanel{};
+                    } else if (s.sel >= ZONE_SEL && s.sel < ZONE_SEL + TZ_COUNT) {
+                        int k = s.sel - ZONE_SEL;
+                        s.layout.zx[s.hud_mode][k] = 0.0f, s.layout.zy[s.hud_mode][k] = 0.0f;
+                        s.layout.zscale[s.hud_mode][k] = 1.0f, s.layout.zaspect[s.hud_mode][k] = 0.0f;
+                        s.layout.zhide[s.hud_mode][k] = 0;
+                        publish_zones(s.layout);
+                    } else if (s.sel >= 0 && s.sel < C_COUNT) {
+                        s.layout.x[s.sel] = DEFS[s.sel].x, s.layout.y[s.sel] = DEFS[s.sel].y, s.layout.scale[s.sel] = 1.0f;
+                    }
+                } else if (i == E_DEFAULTS) {  // 全部默认（按键 + 当前这套 HUD）
                     s.layout = defaults();
                     publish_zones(s.layout);
                     g_style = s.layout.style;
@@ -900,6 +948,7 @@ void edit_event(State &s, const SDL_Event *e, float x, float y) {
             for (int k = 0; k < TZ_COUNT && c < 0; k++)
                 if (zone_rect_edit(z, s.layout, s.hud_mode, k, s.w, s.h).in(x, y)) c = ZONE_SEL + k;
         }
+        if (c < 0 && grab.in(x, y)) { f->kind = F_MENU, s.sel = SEL_PANEL; return; }
         if (c < 0 && panel.in(x, y)) { f->kind = F_MENU; return; }
         f->kind = F_EDIT, f->ctl = c;
         s.sel = c;
@@ -910,13 +959,19 @@ void edit_event(State &s, const SDL_Event *e, float x, float y) {
     if (e->type == SDL_EVENT_FINGER_MOTION) {
         float dx = x - f->x, dy = y - f->y;
         f->x = x, f->y = y;
+        if (f->kind == F_MENU && s.sel == SEL_PANEL) { panel_move(dx, dy, s.w, s.h); return; }
         if (f->kind != F_EDIT) return;
         if (s.pinch) {
             Finger *a = nullptr, *b = nullptr;
             for (Finger &g : s.f)
                 if (g.kind == F_EDIT) (a ? b : a) = &g;
             int c = a && a->ctl >= 0 ? a->ctl : b && b->ctl >= 0 ? b->ctl : -1;
-            if (a && b && c >= 0) {
+            if (a && b && s.sel == SEL_PANEL) {
+                float ratio = hypotf(a->x - b->x, a->y - b->y) / s.pinch_d0;
+                Rect pp, bb[E_COUNT];
+                editor_panel(g_epanel, s.w, s.h, &pp, bb);
+                panel_resize(g_epanel.k * ratio, (pp.x0 + pp.x1) * .5f, (pp.y0 + pp.y1) * .5f, s.w, s.h);
+            } else if (a && b && c >= 0) {
                 float ratio = hypotf(a->x - b->x, a->y - b->y) / s.pinch_d0;
                 if (c >= ZONE_SEL && c < ZONE_SEL + TZ_COUNT) {
                     int k = c - ZONE_SEL;
@@ -2202,12 +2257,21 @@ void draw_editor(ImDrawList *dl, ImFont *font, const State &s, float w, float h)
             }
         }
     }
-    Rect panel, btn[E_COUNT];
-    editor_panel(w, h, &panel, btn);
+    Rect panel, btn[E_COUNT], grab;
+    editor_panel(g_epanel, w, h, &panel, btn, &grab);
     float line = .004f * h;
     plate(dl, panel, line, 1.0f, false);
-    text_center(dl, font, .034f * h, ImVec2((panel.x0 + panel.x1) * .5f, panel.y0 + .045f * h), GLOW, T("Controls and HUD"));
-    const char *sub = s.sel >= ZONE_SEL
+    bool picked = s.sel == SEL_PANEL;
+    text_center(dl, font, .034f * h, ImVec2((panel.x0 + panel.x1) * .5f, panel.y0 + .045f * h), GLOW,
+                picked ? T("Controls and HUD") : T("Controls and HUD"));
+    if (picked) {  // 面板被选中：右边显示它的大小百分比（与 APK 相同）
+        char pct[16];
+        snprintf(pct, sizeof pct, "%d%%", (int)lroundf(std::clamp(g_epanel.k, EPANEL_MIN, 1.0f) * 100));
+        text_center(dl, font, .03f * h, ImVec2(panel.x1 - .075f * h, panel.y0 + .045f * h), GLOW, pct);
+    }
+    const char *sub = picked
+        ? "The panel: drag its title to move it  -  pinch or use - / + for its size"
+        : s.sel >= ZONE_SEL
         ? (s.hud_mode == 0 && s.sel == ZONE_SEL + TZ_ITEM
            ? "The item bar picks and uses items with the touch controls: it can't be hidden here"
            : s.layout.zhide[s.hud_mode][s.sel - ZONE_SEL] ? "Hidden: Show brings it back" : "Drag to move  -  pinch or use - / + for its size")
@@ -2216,19 +2280,19 @@ void draw_editor(ImDrawList *dl, ImFont *font, const State &s, float w, float h)
                     : "Tap a control or a part of the game's screen to pick it, drag it to move it";
     text_center(dl, font, .022f * h, ImVec2((panel.x0 + panel.x1) * .5f, panel.y0 + .078f * h), INK, T(sub));
     static const char *const STYLE_LABEL[STYLE_COUNT] = {"Attacks: pill", "Attacks: buttons", "Attacks: corner"};
-    const char *hide_lbl = s.sel >= ZONE_SEL
-        ? (s.layout.zhide[s.hud_mode][s.sel - ZONE_SEL] ? "Show" : "Hide")
-        : "Reset";
+    int part = s.sel >= ZONE_SEL ? s.sel - ZONE_SEL : -1;
+    const char *hide_lbl = part >= 0 && s.layout.zhide[s.hud_mode][part] ? "Show" : "Hide";
+    // 与 APK 的十格一致（两行：- + Hide Reset / Layout Style HUD Defaults Cancel Save）
     const char *const LABEL[E_COUNT] = {
-        "-", "+", hide_lbl,
+        "-", "+", hide_lbl, "Reset",
         ranged_layout() ? "Layout: ranged" : "Layout: melee",
         STYLE_LABEL[s.layout.style],
         s.hud_mode ? "HUD: controller" : "HUD: touch",
         "Defaults", "Cancel", "Save"
     };
     for (int i = 0; i < E_COUNT; i++) {
-        bool off = ((i == E_SMALLER || i == E_BIGGER) && s.sel < 0) ||
-                   (i == E_HIDE && (s.sel < 0 || (s.hud_mode == 0 && s.sel == ZONE_SEL + TZ_ITEM))) ||
+        bool off = ((i == E_SMALLER || i == E_BIGGER || i == E_RESET) && s.sel < 0 && !picked) ||
+                   (i == E_HIDE && (part < 0 || (s.hud_mode == 0 && part == TZ_ITEM))) ||
                    (i == E_SET && s.hud_mode != 0) ||
                    (i == E_STYLE && (s.hud_mode != 0 || ranged_layout()));
         bool lit = false;
