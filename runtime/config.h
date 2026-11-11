@@ -148,6 +148,13 @@ typedef struct {
     int ldn_ryu_serve_port;   // [Multiplayer] RyuServePort: its port; 0 = 30456, the LdnServer default
     int ldn_room_serve;       // [Multiplayer] RoomServe: this game runs a suyu-style room itself (runtime/net/roomsrv.c): the pseudo room for suyu-family players
     int ldn_room_serve_port;  // [Multiplayer] RoomServePort: its port; 0 = 24872, the rooms' default
+    // ---- APK 设置面板（gu-native settings_panel.cpp）需要、iOS 侧暂未生效的项 ----
+    // 先让面板原样编译/显示；对应功能（陀螺仪、鼠标菜单、草地/阴影/混响、手机震动等）
+    // 在 iOS 没有实现通路，改了不会有效果，后续按需接上或从面板删掉。
+    int fill_screen, grass, shadows, reverb;
+    int show_stats;          // 0 关 / 1 简 / 2 全（APK 的 stats 选项）
+    int gyro_aim; float gyro_sensitivity;
+    int mouse_menus, phone_rumble, pause_background, pause_menu;
 } Config;
 // The hub server used when ini Server is empty (runtime/net/ldn.c, server/): the project's public one (an Oracle
 // Cloud VM; a DuckDNS name, so it can move without a release). "" = no default.
