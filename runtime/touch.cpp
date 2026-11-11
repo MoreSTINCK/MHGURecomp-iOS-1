@@ -1349,6 +1349,20 @@ extern "C" void touch_input(bool pad_connected, bool typing, uint64_t *buttons, 
         if (part && part != s.stick_part) tap_due();
         s.stick_part = part;
         *buttons |= dpad_buttons(part);
+        // 有些界面读的是左摇杆的模拟量而不是十字键（村庄的目的地选择：Bherna / Hub / Hire 就是一例，
+        // 只发方向键时摇杆"拖不动"）。除地图那种大面板外，菜单里同时给一份模拟量。
+        *lx = 0, *ly = 0;  // (菜单分支不依赖调用方的初值)
+        uint64_t panel = g_panel_ns.load();
+        bool panel_now = panel && SDL_GetTicksNS() - panel < 400 * 1000000ull;
+        if (part && !panel_now && r > 0.0f) {
+            float dx = (s.kx - s.bx) / r, dy = -(s.ky - s.by) / r;
+            float m = sqrtf(dx * dx + dy * dy);
+            if (m > .35f) {  // 死区：轻碰不会让人物走起来
+                float k = std::min(1.0f, (m - .35f) / .5f);
+                *lx = (int)(dx / m * k * 32767.0f);
+                *ly = (int)(dy / m * k * 32767.0f);
+            }
+        }
         return;
     }
     s.stick_part = 0;
