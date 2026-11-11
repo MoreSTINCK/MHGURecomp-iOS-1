@@ -1,0 +1,36 @@
+# Nothing from the game may be committed: no game files, no generated code, no extracted data.
+/generated/
+/build/
+/obj/
+/build-linux/
+/obj-linux/
+/run/
+/game/
+/save/
+/mods/
+/engine_modules/
+/data/
+tools/venv/
+__pycache__/
+*.pyc
+*.o
+*.exe
+*.dll
+*.arc
+*.keys
+*.rar
+*.zip
+*.7z
+/run2/
+/run3/
+/third_party/ffmpeg/
+/third_party/sdl3/
+/third_party/shaderc/
+/third_party/zstd/
+/dist/
+
+# the hub server built in place (server/README.md)
+server/mhgurecomp-hubserver
+server/mhgurecomp-hubserver.exe
+/build-android/
+/obj-android/

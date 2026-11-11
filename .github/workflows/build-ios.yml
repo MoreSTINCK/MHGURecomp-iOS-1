@@ -1,0 +1,199 @@
+name: Build iOS IPA
+
+# Needs generated/ from your own dump (make gen): none is in this repository.
+on:
+  push:
+    branches: [ main, master, build ]
+  workflow_dispatch:
+
+env:
+  MOLTENVK_VER: v1.3.0
+  SDL3_TAG: release-3.4.18
+  SHADERC_TAG: v2026.4
+  FFMPEG_TAG: n9.0.2
+  IOS_MIN: "15.0"
+
+jobs:
+  build:
+    name: Build MHGURecomp for iOS / iPadOS
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Each group of libraries has a cache of its own, saved as soon as it is built: a later failure doesn't build it again.
+      - name: Restore MoltenVK, SDL3, shaderc
+        id: cache-libs
+        uses: actions/cache/restore@v4
+        with:
+          path: deps-libs
+          key: ios-libs-macos-15-${{ env.MOLTENVK_VER }}-${{ env.SDL3_TAG }}-${{ env.SHADERC_TAG }}-${{ env.IOS_MIN }}
+
+      - name: Build MoltenVK, SDL3, shaderc
+        if: steps.cache-libs.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p deps-libs/lib deps-libs/include
+          NCPU=$(sysctl -n hw.ncpu)
+
+          echo "=== 1. Downloading MoltenVK for iOS ==="
+          curl -fL -o MoltenVK-ios.tar https://github.com/KhronosGroup/MoltenVK/releases/download/$MOLTENVK_VER/MoltenVK-ios.tar
+          tar -xf MoltenVK-ios.tar
+          cp MoltenVK/MoltenVK/static/MoltenVK.xcframework/ios-arm64/libMoltenVK.a deps-libs/lib/libMoltenVK.a
+          cp -r MoltenVK/MoltenVK/include/* deps-libs/include/
+          rm -rf MoltenVK MoltenVK-ios.tar
+
+          echo "=== 2. Building SDL3 for iOS ==="
+          git clone --depth 1 --branch $SDL3_TAG https://github.com/libsdl-org/SDL.git sdl3-src
+          cmake -S sdl3-src -B sdl3-build \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=$IOS_MIN \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=$PWD/sdl3-install \
+            -DSDL_STATIC=ON \
+            -DSDL_SHARED=OFF \
+            -DSDL_TESTS=OFF \
+            -DSDL_TEST_LIBRARY=OFF
+          cmake --build sdl3-build --target install --config Release -j$NCPU
+          cp sdl3-install/lib/libSDL3.a deps-libs/lib/libSDL3.a
+          cp -r sdl3-install/include/* deps-libs/include/
+          rm -rf sdl3-src sdl3-build sdl3-install
+
+          echo "=== 3. Building shaderc for iOS ==="
+          git clone --depth 1 --branch $SHADERC_TAG https://github.com/google/shaderc.git shaderc-src
+          cd shaderc-src
+          python3 utils/git-sync-deps
+          cmake -B build \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=$IOS_MIN \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSHADERC_SKIP_TESTS=ON \
+            -DSHADERC_SKIP_EXAMPLES=ON \
+            -DSHADERC_SKIP_COPYRIGHT_CHECK=ON
+          cmake --build build --target shaderc_combined --config Release -j$NCPU
+          find build -name "libshaderc_combined.a" -exec cp {} ../deps-libs/lib/libshaderc_combined.a \;
+          cp -r libshaderc/include/* ../deps-libs/include/
+          cd ..
+          rm -rf shaderc-src
+          ls -lh deps-libs/lib/
+
+      - name: Save MoltenVK, SDL3, shaderc
+        if: steps.cache-libs.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: deps-libs
+          key: ios-libs-macos-15-${{ env.MOLTENVK_VER }}-${{ env.SDL3_TAG }}-${{ env.SHADERC_TAG }}-${{ env.IOS_MIN }}
+
+      - name: Restore FFmpeg
+        id: cache-ffmpeg
+        uses: actions/cache/restore@v4
+        with:
+          path: deps-ffmpeg
+          key: ios-ffmpeg-macos-15-${{ env.FFMPEG_TAG }}-${{ env.IOS_MIN }}
+
+      # (the movies' MP4s, H.264 and AAC: the Makefile's FFMPEG_CONF, cross-compiled as android/android.mk does)
+      - name: Build FFmpeg
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+        run: |
+          NCPU=$(sysctl -n hw.ncpu)
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          FLAGS="-target arm64-apple-ios$IOS_MIN -isysroot $SDK"
+          git clone --depth 1 --branch $FFMPEG_TAG https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+          cd ffmpeg-src
+          ./configure --prefix=$GITHUB_WORKSPACE/deps-ffmpeg \
+            --disable-everything --disable-programs --disable-doc --disable-network --disable-autodetect \
+            --disable-debug --disable-avdevice --disable-avfilter --disable-swscale --disable-swresample \
+            --enable-static --disable-shared --enable-protocol=file --enable-demuxer=mov \
+            --enable-parser=h264,aac --enable-decoder=h264,aac \
+            --enable-cross-compile --target-os=darwin --arch=aarch64 --disable-asm --enable-pic \
+            --cc="xcrun --sdk iphoneos clang" --cxx="xcrun --sdk iphoneos clang++" \
+            --extra-cflags="$FLAGS" --extra-ldflags="$FLAGS" --host-cc=clang \
+            || { tail -40 ffbuild/config.log; exit 1; }
+          make -j$NCPU install
+          cd ..
+          rm -rf ffmpeg-src
+          ls -lh deps-ffmpeg/lib/
+
+      - name: Save FFmpeg
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: deps-ffmpeg
+          key: ios-ffmpeg-macos-15-${{ env.FFMPEG_TAG }}-${{ env.IOS_MIN }}
+
+      - name: Collect the libraries
+        run: |
+          mkdir -p deps
+          cp -R deps-libs/* deps/
+          cp -R deps-ffmpeg/lib deps-ffmpeg/include deps/
+
+      # The game code's objects: their sources are newer after a checkout, so they are touched once restored.
+      - name: Restore game code objects
+        id: cache-gen
+        uses: actions/cache/restore@v4
+        with:
+          path: obj/gen
+          key: ios-gen-${{ hashFiles('generated/**', 'runtime/cpu.h', 'runtime/vfp.h', 'runtime/neon_rt.h', 'runtime/gamelib.h') }}
+
+      - name: Build MHGURecomp iOS binary
+        run: |
+          [ -d obj/gen ] && find obj/gen -name '*.o' -exec touch {} +
+          NCPU=$(sysctl -n hw.ncpu)
+          make -j$NCPU DEPS=deps VERSION="$(git log -1 --format=%s | sed -n 's/^Build //p')-ios"
+          file build/MHGURecomp
+
+      - name: Save game code objects
+        if: always() && steps.cache-gen.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: obj/gen
+          key: ios-gen-${{ hashFiles('generated/**', 'runtime/cpu.h', 'runtime/vfp.h', 'runtime/neon_rt.h', 'runtime/gamelib.h') }}
+
+      - name: Package .app and .ipa bundle
+        run: |
+          APP_DIR="Payload/MHGURecomp.app"
+          mkdir -p "$APP_DIR"
+
+          # Copy main executable
+          cp build/MHGURecomp "$APP_DIR/MHGURecomp"
+
+          # Copy plists, icons and the recorded pipelines (runtime/nvn/vulkan/exec.c plist_load: beside the executable)
+          cp ios/Info.plist "$APP_DIR/Info.plist"
+          cp ios/Entitlements.plist "$APP_DIR/Entitlements.plist"
+          cp ios/Icon.png "$APP_DIR/Icon.png"
+          cp ios/Icon.png "$APP_DIR/AppIcon60x60@2x.png"
+          cp ios/Icon.png "$APP_DIR/AppIcon76x76@2x~ipad.png"
+          # (the menu's Chinese: a subset of Noto Sans SC, beside the executable, overlay.cpp load_cjk_font)
+          cp ios/FontSC.ttf "$APP_DIR/FontSC.ttf"
+          cp extras/pipelines.list "$APP_DIR/pipelines.list"
+
+          # Strip debug symbols to optimize size
+          xcrun strip -S "$APP_DIR/MHGURecomp"
+
+          # Clear extended attributes before signing
+          xattr -cr "$APP_DIR" 2>/dev/null || true
+
+          # Ad-hoc sign ONLY the inner executable with increased-memory-limit entitlement
+          # (Sideloaders read entitlements from the binary and re-sign the whole .app bundle on-device.)
+          codesign --force --sign - --entitlements ios/Entitlements.plist "$APP_DIR/MHGURecomp"
+
+          # Verify binary signature and entitlements
+          codesign -dvvv --entitlements :- "$APP_DIR/MHGURecomp"
+
+          # Remove bundle-level _CodeSignature so sideloaders can cleanly sign on-device
+          rm -rf "$APP_DIR/_CodeSignature"
+
+          # Create IPA archive
+          zip -r9 MHGURecomp.ipa Payload
+          ls -lh MHGURecomp.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MHGURecomp-iOS-ipa
+          path: MHGURecomp.ipa
+          retention-days: 3

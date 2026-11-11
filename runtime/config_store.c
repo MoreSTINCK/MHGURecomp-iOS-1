@@ -1,0 +1,453 @@
+// Atomic INI persistence and live settings. Cold boot state is never mutated;
+// each consumer reads hot values atomically on its own thread.
+#include "config.h"
+#include <SDL3/SDL.h>
+#include <ctype.h>
+#include <errno.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
+
+static Config saved, startup;
+static bool have_saved, runtime_ready, runtime_fsr;
+static SDL_AtomicInt window_focused = {1};
+// [Display]
+static SDL_AtomicInt live_fov;
+// [Anti-aliasing]
+static SDL_AtomicInt live_msaa = {1};
+static SDL_AtomicInt live_fxaa = {1};
+static SDL_AtomicInt live_fxaa_mode;
+// [Upscaler]
+static SDL_AtomicInt live_fsr_sharpness;
+static SDL_AtomicInt live_fsr_reactive;
+// [Graphics]
+static SDL_AtomicInt live_draw = {0x3f800000};
+static SDL_AtomicInt live_smooth;
+static SDL_AtomicInt live_kerning;
+static SDL_AtomicInt live_bold;
+// [HDR]
+static SDL_AtomicInt live_hdr, live_hdr_format, live_hdr_gamma = {HDR_GAMMA_22}, live_hdr_tonemap = {HDR_TONEMAP_RENODRT};
+static SDL_AtomicInt live_hdr_scene = {1}, live_hdr_analysis;
+static SDL_AtomicInt live_hdr_peak = {0x447a0000}, live_hdr_game = {0x434b0000}, live_hdr_ui = {0x434b0000};  // 1000, 203
+static SDL_AtomicInt live_hdr_exposure = {0x3f266666}, live_hdr_flare = {0}, live_hdr_bloom = {0x42c80000};  // 0.65, 0, 100
+static SDL_AtomicInt live_hdr_highlights = {0x42700000}, live_hdr_shadows = {0x42480000}, live_hdr_contrast = {0x42480000};  // 60, 50, 50
+static SDL_AtomicInt live_hdr_saturation = {0x42480000}, live_hdr_highlight_saturation = {0x42a40000};  // 50, 82
+// [Performance]
+static SDL_AtomicInt show_fps;
+static SDL_AtomicInt show_battery;
+static SDL_AtomicInt live_fps;
+static SDL_AtomicInt live_vsync = {1};
+// [Controls]
+static SDL_AtomicInt live_face;
+static SDL_AtomicInt live_menu_confirm;
+static SDL_AtomicInt live_background = {1};
+static SDL_AtomicInt live_combo;
+static SDL_AtomicInt live_chat_key;
+static SDL_AtomicInt menu_chord = {1};
+// [Touch]
+static SDL_AtomicInt live_touch, live_touch_hud, live_touch_show[TB_COUNT], live_touch_combo[TOUCH_COMBOS],
+                     live_touch_combo_pad[TOUCH_COMBOS], live_touch_cam, live_touch_opacity, live_lock_on = {1},
+                     live_touch_vibration = {1};
+// [Mouse]
+static SDL_AtomicInt live_mouse;
+// [Keybinds]
+static SDL_AtomicInt live_binds[BINDS][BIND_KEYS];
+// [Multiplayer]
+static SDL_AtomicInt live_ldn_port;
+static SDL_AtomicInt live_sync_zako;
+static SDL_AtomicInt live_share_urgent;
+// [Monster HP, Village Quests]
+static SDL_AtomicInt live_village;
+// [Discord]
+static SDL_AtomicInt live_discord;
+static SDL_AtomicInt live_discord_hunter;
+// [Bonus Content]
+static SDL_AtomicInt live_bonus;
+// [Audio]
+static SDL_AtomicInt volume = {100};
+static SDL_AtomicInt mute_in_background;
+// [Application]
+static SDL_AtomicInt confirm_exit = {1};
+static SDL_AtomicInt language = {0};
+static void set_float(SDL_AtomicInt *slot, float value) {
+    int bits; _Static_assert(sizeof bits == sizeof value, "32-bit float settings");
+    memcpy(&bits, &value, sizeof bits); SDL_SetAtomicInt(slot, bits);
+}
+static float get_float(SDL_AtomicInt *slot) {
+    int bits = SDL_GetAtomicInt(slot); float value; memcpy(&value, &bits, sizeof value); return value;
+}
+static SDL_SpinLock live_ldn_lock;  // [Multiplayer] Server / Key / Join: read by the network threads (runtime/net/ldn.c)
+static char live_ldn_server[sizeof saved.ldn_server], live_ldn_key[sizeof saved.ldn_key], live_ldn_join[sizeof saved.ldn_join];
+static SDL_SpinLock live_hp_lock;  // [Monster HP], HubHP: read when a large monster's HP is set (runtime/hle/hpscale.c)
+static HpScale live_hp;
+// A save updates changed hot fields only. Saving the volume must not silently
+// remove an unchanged FOV/FPS override supplied by the development environment.
+static void publish_live(const Config *c, bool all) {
+    if (all || c->fps != saved.fps) set_float(&live_fps, (float)c->fps);
+    if (all || c->fov != saved.fov) set_float(&live_fov, c->fov);
+    if (all || c->mouse_sensitivity != saved.mouse_sensitivity) set_float(&live_mouse, c->mouse_sensitivity);
+    if (all || c->draw_distance != saved.draw_distance) set_float(&live_draw, c->draw_distance);
+    if (all || c->fxaa != saved.fxaa) SDL_SetAtomicInt(&live_fxaa, c->fxaa);
+    if (all || c->msaa != saved.msaa) SDL_SetAtomicInt(&live_msaa, c->msaa);
+    if (all || c->vsync != saved.vsync) SDL_SetAtomicInt(&live_vsync, c->vsync);
+    if (all || c->face_buttons != saved.face_buttons) SDL_SetAtomicInt(&live_face, c->face_buttons);
+    if (all || c->menu_confirm != saved.menu_confirm) SDL_SetAtomicInt(&live_menu_confirm, c->menu_confirm);
+    if (all || c->background_input != saved.background_input) SDL_SetAtomicInt(&live_background, c->background_input);
+    if (all || c->combo_window != saved.combo_window) SDL_SetAtomicInt(&live_combo, c->combo_window);
+    if (all || c->touch_controls != saved.touch_controls) SDL_SetAtomicInt(&live_touch, c->touch_controls);
+    if (all || c->touch_hud != saved.touch_hud) SDL_SetAtomicInt(&live_touch_hud, c->touch_hud);
+    if (all || memcmp(c->touch_show, saved.touch_show, sizeof c->touch_show))
+        for (int i = 0; i < TB_COUNT; i++) SDL_SetAtomicInt(&live_touch_show[i], c->touch_show[i]);
+    if (all || memcmp(c->touch_combo, saved.touch_combo, sizeof c->touch_combo) ||
+        memcmp(c->touch_combo_pad, saved.touch_combo_pad, sizeof c->touch_combo_pad))
+        for (int i = 0; i < TOUCH_COMBOS; i++) {
+            SDL_SetAtomicInt(&live_touch_combo[i], (int)config_combo_mask(c->touch_combo[i]));
+            SDL_SetAtomicInt(&live_touch_combo_pad[i], c->touch_combo_pad[i]);
+        }
+    if (all || c->lock_on != saved.lock_on) SDL_SetAtomicInt(&live_lock_on, c->lock_on);
+    if (all || c->touch_camera != saved.touch_camera) set_float(&live_touch_cam, c->touch_camera);
+    if (all || c->touch_opacity != saved.touch_opacity) set_float(&live_touch_opacity, c->touch_opacity);
+    if (all || c->touch_vibration != saved.touch_vibration) SDL_SetAtomicInt(&live_touch_vibration, c->touch_vibration);
+    if (all || strcmp(c->chat_key, saved.chat_key))
+        SDL_SetAtomicInt(&live_chat_key, *c->chat_key ? (int)SDL_GetScancodeFromName(c->chat_key) : 0);
+    if (all || c->fxaa_mode != saved.fxaa_mode) SDL_SetAtomicInt(&live_fxaa_mode, c->fxaa_mode);
+    if (all || c->smooth_gradients != saved.smooth_gradients) SDL_SetAtomicInt(&live_smooth, c->smooth_gradients);
+    if (all || c->fix_kerning != saved.fix_kerning) SDL_SetAtomicInt(&live_kerning, c->fix_kerning);
+    if (all || c->bold_text != saved.bold_text) SDL_SetAtomicInt(&live_bold, c->bold_text);
+    if (all || c->hdr != saved.hdr) SDL_SetAtomicInt(&live_hdr, c->hdr);
+    if (all || c->hdr_format != saved.hdr_format) SDL_SetAtomicInt(&live_hdr_format, c->hdr_format);
+    if (all || c->hdr_gamma != saved.hdr_gamma) SDL_SetAtomicInt(&live_hdr_gamma, c->hdr_gamma);
+    if (all || c->hdr_peak != saved.hdr_peak) set_float(&live_hdr_peak, c->hdr_peak);
+    if (all || c->hdr_game != saved.hdr_game) set_float(&live_hdr_game, c->hdr_game);
+    if (all || c->hdr_ui != saved.hdr_ui) set_float(&live_hdr_ui, c->hdr_ui);
+    if (all || c->hdr_tonemap != saved.hdr_tonemap) SDL_SetAtomicInt(&live_hdr_tonemap, c->hdr_tonemap);
+    if (all || c->hdr_scene != saved.hdr_scene) SDL_SetAtomicInt(&live_hdr_scene, c->hdr_scene);
+    if (all || c->hdr_analysis != saved.hdr_analysis) SDL_SetAtomicInt(&live_hdr_analysis, c->hdr_analysis);
+    if (all || c->hdr_exposure != saved.hdr_exposure) set_float(&live_hdr_exposure, c->hdr_exposure);
+    if (all || c->hdr_highlights != saved.hdr_highlights) set_float(&live_hdr_highlights, c->hdr_highlights);
+    if (all || c->hdr_shadows != saved.hdr_shadows) set_float(&live_hdr_shadows, c->hdr_shadows);
+    if (all || c->hdr_contrast != saved.hdr_contrast) set_float(&live_hdr_contrast, c->hdr_contrast);
+    if (all || c->hdr_saturation != saved.hdr_saturation) set_float(&live_hdr_saturation, c->hdr_saturation);
+    if (all || c->hdr_highlight_saturation != saved.hdr_highlight_saturation)
+        set_float(&live_hdr_highlight_saturation, c->hdr_highlight_saturation);
+    if (all || c->hdr_flare != saved.hdr_flare) set_float(&live_hdr_flare, c->hdr_flare);
+    if (all || c->hdr_bloom != saved.hdr_bloom) set_float(&live_hdr_bloom, c->hdr_bloom);
+    if (all || c->discord != saved.discord) SDL_SetAtomicInt(&live_discord, c->discord);
+    if (all || c->discord_hunter != saved.discord_hunter) SDL_SetAtomicInt(&live_discord_hunter, c->discord_hunter);
+    if (all || c->share_urgent != saved.share_urgent) SDL_SetAtomicInt(&live_share_urgent, c->share_urgent);
+    if (all || c->fsr_sharpness != saved.fsr_sharpness) set_float(&live_fsr_sharpness, c->fsr_sharpness);
+    if (all || c->fsr_reactive != saved.fsr_reactive) set_float(&live_fsr_reactive, c->fsr_reactive);
+    if (all || c->village_in_hub != saved.village_in_hub) SDL_SetAtomicInt(&live_village, c->village_in_hub);
+    if (all || memcmp(&c->hp, &saved.hp, sizeof c->hp)) {
+        SDL_LockSpinlock(&live_hp_lock);
+        live_hp = c->hp;
+        SDL_UnlockSpinlock(&live_hp_lock);
+    }
+    for (int i = 0; i < BINDS; i++)
+        for (int k = 0; k < BIND_KEYS; k++)
+            if (all || c->binds[i][k] != saved.binds[i][k]) SDL_SetAtomicInt(&live_binds[i][k], c->binds[i][k]);
+    if (all || strcmp(c->ldn_server, saved.ldn_server) || strcmp(c->ldn_key, saved.ldn_key) || strcmp(c->ldn_join, saved.ldn_join)) {
+        SDL_LockSpinlock(&live_ldn_lock);
+        if (all || strcmp(c->ldn_server, saved.ldn_server)) memcpy(live_ldn_server, c->ldn_server, sizeof live_ldn_server);
+        if (all || strcmp(c->ldn_key, saved.ldn_key)) memcpy(live_ldn_key, c->ldn_key, sizeof live_ldn_key);
+        if (all || strcmp(c->ldn_join, saved.ldn_join)) memcpy(live_ldn_join, c->ldn_join, sizeof live_ldn_join);
+        SDL_UnlockSpinlock(&live_ldn_lock);
+    }
+    if (all || c->ldn_port != saved.ldn_port) SDL_SetAtomicInt(&live_ldn_port, c->ldn_port);
+    if (all || c->sync_small_monsters != saved.sync_small_monsters) SDL_SetAtomicInt(&live_sync_zako, c->sync_small_monsters);
+    if (all || c->bonus_content != saved.bonus_content) SDL_SetAtomicInt(&live_bonus, c->bonus_content);
+}
+void config_store_loaded(const Config *c) {
+    publish_live(c, !have_saved);
+    saved = *c; have_saved = true;
+    SDL_SetAtomicInt(&language, c->language);
+    SDL_SetAtomicInt(&volume, c->volume);
+    SDL_SetAtomicInt(&mute_in_background, c->mute_in_background);
+    SDL_SetAtomicInt(&confirm_exit, c->confirm_exit);
+    SDL_SetAtomicInt(&show_fps, c->show_fps);
+    SDL_SetAtomicInt(&menu_chord, c->menu_chord);
+    SDL_SetAtomicInt(&show_battery, c->show_battery);
+}
+void config_runtime_init(const Config *effective) {
+    startup = saved; runtime_ready = true; runtime_fsr = effective->fsr != 0;
+    publish_live(effective, true);
+    const char *override = getenv("MHGU_FRAMERATE");
+    if (override && *override) {
+        float f = strtof(override, NULL);
+        if (!(f >= 30)) f = 30;
+        if (f > 240) f = 240;
+        set_float(&live_fps, f);
+    }
+}
+float config_live_fps(void) { return get_float(&live_fps); }
+float config_live_fov(void) { return get_float(&live_fov); }
+float config_live_mouse_sensitivity(void) { return get_float(&live_mouse); }
+float config_live_draw_distance(void) { return get_float(&live_draw); }
+int config_live_fxaa(void) { return runtime_fsr ? 0 : SDL_GetAtomicInt(&live_fxaa); }
+int config_live_msaa(void) { return runtime_fsr ? 1 : SDL_GetAtomicInt(&live_msaa); }
+int config_live_vsync(void) { return SDL_GetAtomicInt(&live_vsync); }
+int config_live_menu_confirm(void) { return SDL_GetAtomicInt(&live_menu_confirm); }
+int config_live_face_buttons(void) { return SDL_GetAtomicInt(&live_face); }
+int config_live_background_input(void) { return SDL_GetAtomicInt(&live_background); }
+int config_live_combo_window(void) { return SDL_GetAtomicInt(&live_combo); }
+int config_live_touch_controls(void) { return SDL_GetAtomicInt(&live_touch); }
+int config_live_touch_hud(void) { return SDL_GetAtomicInt(&live_touch_hud); }
+int config_live_touch_show(int button) { return SDL_GetAtomicInt(&live_touch_show[button]); }
+uint32_t config_live_touch_combo(int index) { return (uint32_t)SDL_GetAtomicInt(&live_touch_combo[index]); }
+int config_live_touch_combo_pad(int index) { return SDL_GetAtomicInt(&live_touch_combo_pad[index]); }
+float config_live_touch_camera(void) { return get_float(&live_touch_cam); }
+float config_live_touch_opacity(void) { return get_float(&live_touch_opacity); }
+int config_live_touch_vibration(void) { return SDL_GetAtomicInt(&live_touch_vibration); }
+int config_live_lock_on(void) { return SDL_GetAtomicInt(&live_lock_on); }
+
+// The names of a combined button's parts, in BTN_* order (hle/input.h)
+static const char *const COMBO_NAMES[16] = {"A", "B", "X", "Y", "L3", "R3", "L", "R", "ZL", "ZR", "Plus", "Minus",
+                                            "Left", "Up", "Right", "Down"};
+uint32_t config_combo_mask(const char *text) {
+    uint32_t mask = 0;
+    while (*text) {
+        const char *end = strchr(text, '+');
+        size_t n = end ? (size_t)(end - text) : strlen(text);
+        bool known = false;
+        for (int i = 0; i < 16; i++)
+            if (strlen(COMBO_NAMES[i]) == n && !strncmp(text, COMBO_NAMES[i], n)) mask |= 1u << i, known = true;
+        if (!known) return 0;
+        text += n + (end ? 1 : 0);
+    }
+    return mask;
+}
+void config_combo_text(uint32_t mask, char *out, size_t size) {
+    size_t n = 0;
+    out[0] = 0;
+    for (int i = 0; i < 16; i++)
+        if (mask >> i & 1) n += (size_t)snprintf(out + n, size - n, "%s%s", n ? "+" : "", COMBO_NAMES[i]);
+}
+int config_live_chat_key(void) { return SDL_GetAtomicInt(&live_chat_key); }
+int config_live_fxaa_mode(void) { return SDL_GetAtomicInt(&live_fxaa_mode); }
+int config_live_smooth_gradients(void) { return SDL_GetAtomicInt(&live_smooth); }
+int config_live_fix_kerning(void) { return SDL_GetAtomicInt(&live_kerning); }
+int config_live_bold_text(void) { return SDL_GetAtomicInt(&live_bold); }
+int config_live_hdr(void) { return SDL_GetAtomicInt(&live_hdr); }
+int config_live_hdr_format(void) { return SDL_GetAtomicInt(&live_hdr_format); }
+int config_live_hdr_gamma(void) { return SDL_GetAtomicInt(&live_hdr_gamma); }
+float config_live_hdr_peak(void) { return get_float(&live_hdr_peak); }
+float config_live_hdr_game(void) { return get_float(&live_hdr_game); }
+float config_live_hdr_ui(void) { return get_float(&live_hdr_ui); }
+int config_live_hdr_tonemap(void) { return SDL_GetAtomicInt(&live_hdr_tonemap); }
+int config_live_hdr_scene(void) { return SDL_GetAtomicInt(&live_hdr_scene); }
+int config_live_hdr_analysis(void) { return SDL_GetAtomicInt(&live_hdr_analysis); }
+float config_live_hdr_exposure(void) { return get_float(&live_hdr_exposure); }
+float config_live_hdr_highlights(void) { return get_float(&live_hdr_highlights); }
+float config_live_hdr_shadows(void) { return get_float(&live_hdr_shadows); }
+float config_live_hdr_contrast(void) { return get_float(&live_hdr_contrast); }
+float config_live_hdr_saturation(void) { return get_float(&live_hdr_saturation); }
+float config_live_hdr_highlight_saturation(void) { return get_float(&live_hdr_highlight_saturation); }
+float config_live_hdr_flare(void) { return get_float(&live_hdr_flare); }
+float config_live_hdr_bloom(void) { return get_float(&live_hdr_bloom); }
+float config_live_fsr_sharpness(void) { return get_float(&live_fsr_sharpness); }
+float config_live_fsr_reactive(void) { return get_float(&live_fsr_reactive); }
+int config_live_village_in_hub(void) { return SDL_GetAtomicInt(&live_village); }
+int config_live_ldn_port(void) { return SDL_GetAtomicInt(&live_ldn_port); }
+int config_live_sync_small_monsters(void) { return SDL_GetAtomicInt(&live_sync_zako); }
+int config_live_bonus_content(void) { return SDL_GetAtomicInt(&live_bonus); }
+void config_live_ldn_join(char *join, size_t size) {
+    SDL_LockSpinlock(&live_ldn_lock);
+    SDL_strlcpy(join, live_ldn_join, size);
+    SDL_UnlockSpinlock(&live_ldn_lock);
+}
+void config_live_hp(HpScale *out) {
+    SDL_LockSpinlock(&live_hp_lock);
+    *out = live_hp;
+    SDL_UnlockSpinlock(&live_hp_lock);
+}
+float config_live_hp_village(void) {
+    SDL_LockSpinlock(&live_hp_lock);
+    float v = live_hp.village;
+    SDL_UnlockSpinlock(&live_hp_lock);
+    return v;
+}
+int config_live_discord(void) { return SDL_GetAtomicInt(&live_discord); }
+int config_live_discord_hunter(void) { return SDL_GetAtomicInt(&live_discord_hunter); }
+int config_live_share_urgent(void) { return SDL_GetAtomicInt(&live_share_urgent); }
+int config_live_bind(int bind, int slot) { return SDL_GetAtomicInt(&live_binds[bind][slot]); }
+void config_live_ldn(char *server, size_t server_size, char *key, size_t key_size) {
+    SDL_LockSpinlock(&live_ldn_lock);
+    if (server) SDL_strlcpy(server, live_ldn_server, server_size);
+    if (key) SDL_strlcpy(key, live_ldn_key, key_size);
+    SDL_UnlockSpinlock(&live_ldn_lock);
+}
+int config_language(void) { return SDL_GetAtomicInt(&language); }
+Config config_editable(void) { return saved; }
+float config_audio_gain(void) {
+    if (SDL_GetAtomicInt(&mute_in_background) && !SDL_GetAtomicInt(&window_focused)) return 0.0f;
+    return SDL_GetAtomicInt(&volume) / 100.0f;
+}
+void config_window_focus(bool focused) { SDL_SetAtomicInt(&window_focused, focused); }
+bool config_confirm_exit(void) { return SDL_GetAtomicInt(&confirm_exit) != 0; }
+bool config_menu_chord(void) { return SDL_GetAtomicInt(&menu_chord) != 0; }
+int config_show_battery(void) { return SDL_GetAtomicInt(&show_battery); }
+bool config_show_fps(void) { return SDL_GetAtomicInt(&show_fps) != 0; }
+bool config_restart_required(const Config *c) {
+    if (!runtime_ready) return false;
+    for (int i = 0; i < g_nsettings; i++) {
+        const ConfigSetting *s = &g_settings[i];
+        if (s->restart && (!config_valid(s, c) || !config_equal(s, c, &startup))) return true;
+    }
+    return false;  // ([Monster HP] Quest<number> overrides: live, config_live_hp)
+}
+
+static bool fail(char *error, size_t size, const char *message) {
+    if (size) snprintf(error, size, "%s", message);
+    return false;
+}
+static bool factor_valid(float f) { return isfinite(f) && f >= HP_SCALE_MIN && f <= HP_SCALE_MAX; }
+bool config_validate(const Config *c, char *error, size_t size) {
+    for (int i = 0; i < g_nsettings; i++)
+        if (!config_valid(&g_settings[i], c)) return fail(error, size, g_settings[i].error);
+    if (c->hp.quests < 0 || c->hp.quests > HP_QUESTS_MAX)
+        return fail(error, size, "Invalid village HP or quest override count.");
+    for (int i = 0; i < c->hp.quests; i++) {
+        if (!c->hp.quest[i].quest) return fail(error, size, "Quest IDs must be greater than zero.");
+        for (int j = 0; j < i; j++)
+            if (c->hp.quest[j].quest == c->hp.quest[i].quest) return fail(error, size, "Duplicate quest ID.");
+        for (int j = 0; j < 4; j++)
+            if (!factor_valid(c->hp.quest[i].scale[j])) return fail(error, size, "Quest HP factors must be 0.05-20.");
+    }
+    if (size) *error = 0;
+    return true;
+}
+
+// What config_save writes: a setting of the table (setting) or a Quest<number> entry (setting NULL)
+typedef struct { const ConfigSetting *setting; const char *section; char key[64], value[256]; bool seen; } Entry;
+#define ENTRY_MAX (HP_QUESTS_MAX + 128)  // (every setting of g_settings, 67 now, and the quests set apart)
+static void normalize(const char *s, char *out, size_t size) {
+    size_t n = 0;
+    for (; *s && n + 1 < size; s++)
+        if (!isspace((unsigned char)*s) && *s != '_' && *s != '-') out[n++] = (char)tolower((unsigned char)*s);
+    out[n] = 0;
+}
+static void flush_section(FILE *out, Entry *entries, int n, const char *section, const char *newline) {
+    for (int i = 0; i < n; i++)
+        if (!entries[i].seen && !strcasecmp(entries[i].section, section)) {
+            fprintf(out, "%s = %s%s", entries[i].key, entries[i].value, newline);
+            entries[i].seen = true;
+        }
+}
+// The entry a "key = value" line is for (NULL: none of them)
+static Entry *entry_of(Entry *entries, int n, const char *key) {
+    const ConfigSetting *s = config_setting(key);
+    char normalized[128], other[128];
+    normalize(key, normalized, sizeof normalized);
+    for (int i = 0; i < n; i++) {
+        if (s ? entries[i].setting == s : !entries[i].setting && (normalize(entries[i].key, other, sizeof other),
+                                                                   !strcmp(normalized, other)))
+            return &entries[i];
+    }
+    return NULL;
+}
+// A line that already says what c has (in its own spelling: "21:9", "1.0", "Borderless Window") stays as it is.
+static bool line_says(const Entry *e, const char *eq, const Config *c) {
+    if (!e->setting) return false;
+    char value[256];
+    snprintf(value, sizeof value, "%.*s", (int)strcspn(eq + 1, ";#\r\n"), eq + 1);
+    char *v = value, *end = value + strlen(value);
+    while (isspace((unsigned char)*v)) v++;
+    while (end > v && isspace((unsigned char)end[-1])) *--end = 0;
+    Config read = *c;
+    return config_parse(e->setting, v, &read) && config_equal(e->setting, &read, c);
+}
+bool config_save(const Config *c, char *error, size_t error_size) {
+    if (!config_validate(c, error, error_size)) return false;
+    static Entry entries[ENTRY_MAX];  // (big: off the stack)
+    int n = 0;
+    if (g_nsettings + c->hp.quests > ENTRY_MAX) return fail(error, error_size, "Too many settings to save (ENTRY_MAX).");
+    for (int i = 0; i < g_nsettings; i++) {
+        Entry *e = &entries[n++];
+        e->setting = &g_settings[i], e->section = g_settings[i].section, e->seen = false;
+        snprintf(e->key, sizeof e->key, "%.*s", (int)strcspn(g_settings[i].key, "|"), g_settings[i].key);
+        config_format(&g_settings[i], c, e->value, sizeof e->value);
+    }
+    for (int i = 0; i < c->hp.quests; i++) {
+        Entry *e = &entries[n++];
+        const float *v = c->hp.quest[i].scale;
+        e->setting = NULL, e->section = "Monster HP", e->seen = false;
+        snprintf(e->key, sizeof e->key, "Quest%u", c->hp.quest[i].quest);
+        snprintf(e->value, sizeof e->value, "%g, %g, %g, %g", (double)v[0], (double)v[1], (double)v[2], (double)v[3]);
+    }
+    char path[1100];
+    config_path(path, sizeof path);
+    char temp[1200];
+    if (snprintf(temp, sizeof temp, "%s.settings-%llu.tmp", path, (unsigned long long)SDL_GetTicksNS()) >= (int)sizeof temp)
+        return fail(error, error_size, "Settings path is too long.");
+    FILE *in = fopen(path, "rb");
+    if (!in && errno != ENOENT) return fail(error, error_size, "Cannot read the existing settings file.");
+    FILE *out = fopen(temp, "wbx");
+    if (!out) { if (in) fclose(in); return fail(error, error_size, "Cannot create a temporary settings file."); }
+    char line[4096], section[128] = "";
+    const char *newline = "\n";
+    bool ok = true, ended_line = true;
+    while (in && fgets(line, sizeof line, in)) {
+        size_t len = strlen(line);
+        if (!strchr(line, '\n') && !feof(in)) { ok = false; break; } // never truncate an unknown line
+        if (strstr(line, "\r\n")) newline = "\r\n";
+        char *s = line; while (isspace((unsigned char)*s)) s++;
+        if (*s == '[' && strchr(s, ']')) {
+            flush_section(out, entries, n, section, newline);
+            snprintf(section, sizeof section, "%.*s", (int)(strchr(s, ']') - s - 1), s + 1);
+        }
+        char *eq = (*s && *s != ';' && *s != '#' && *s != '[') ? strchr(s, '=') : NULL;
+        bool handled = false;
+        if (eq) {
+            char key[128];
+            snprintf(key, sizeof key, "%.*s", (int)(eq - s), s);
+            char *k = key + strlen(key);
+            while (k > key && isspace((unsigned char)k[-1])) *--k = 0;
+            Entry *e = entry_of(entries, n, key);
+            if (e) {
+                const char *comment = strpbrk(eq + 1, ";#");
+                if (line_says(e, eq, c)) fputs(line, out);
+                else if (comment) fprintf(out, "%.*s %s %s", (int)(eq - line + 1), line, e->value, comment);
+                else fprintf(out, "%.*s %s%s", (int)(eq - line + 1), line, e->value, newline);
+                e->seen = true; handled = true; ended_line = true;
+            } else {
+                // Removing an override must remove its old value, including duplicate entries.
+                char normalized[128];
+                normalize(key, normalized, sizeof normalized);
+                if (!strncmp(normalized, "quest", 5) && isdigit((unsigned char)normalized[5])) handled = true;
+            }
+        }
+        if (!handled) { fputs(line, out); ended_line = len && line[len - 1] == '\n'; }
+    }
+    if (in) { if (ferror(in)) ok = false; fclose(in); }
+    if (!ended_line) fputs(newline, out);
+    flush_section(out, entries, n, section, newline);
+    for (int i = 0; i < n; i++) if (!entries[i].seen) {
+        fprintf(out, "%s[%s]%s", newline, entries[i].section, newline);
+        flush_section(out, entries, n, entries[i].section, newline);
+    }
+    if (fflush(out) || ferror(out)) ok = false;
+#ifdef _WIN32
+    if (_commit(_fileno(out))) ok = false;
+#else
+    if (fsync(fileno(out))) ok = false;
+#endif
+    if (fclose(out)) ok = false;
+    if (ok) {
+#ifdef _WIN32
+        ok = MoveFileExA(temp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+        ok = rename(temp, path) == 0;
+#endif
+    }
+    if (!ok) { remove(temp); return fail(error, error_size, "Could not save settings; the previous file was kept."); }
+    config_store_loaded(c);
+    return true;
+}

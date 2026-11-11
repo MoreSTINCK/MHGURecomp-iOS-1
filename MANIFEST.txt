@@ -1,0 +1,30 @@
+MHGURecomp-iOS — host source tree
+packed 2026-11-11 10:21 (UTC+8)
+
+git HEAD: 7259208
+source files: 374
+uncompressed: 15.1 MB
+
+Read PORTING-touch-to-ios.md first: how the touch controls of the Android port
+(gu-native) were brought to this tree, file by file, with the traps.
+
+NOT included (on purpose):
+  generated/    the game's own decompiled code (294 MB), from a private exefs dump:
+                `make gen` with the game's exefs, or the build branch of the private repo
+  .git/         history (39 MB)
+  build output  *.o *.a *.ipa *.log
+
+Recent commits:
+7259208 Background: no GPU submission while the app is away
+09d9622 MSAA: leave the 16-bit UNORM targets single-sampled on Metal
+5c27334 iOS cheats: a byte each, not a std::vector<bool>
+d5b607e iOS: every setting, the mods and the cheats in the native lists
+2caafb7 iOS UI: ui_window is C, not C++
+1bafa6f iOS UI: the launcher class's name, and no <cmath> dependency
+f6b3242 iOS: the start screen and the in-game menu in UIKit, where the glass is the system's
+42b0260 In-game menu: the iOS UIMenu shape instead of the whole panel
+545f7a0 Touch controls: Minus can be picked and kept in the layout editor
+2009eae Settings: the ini comments (every setting's help) in Chinese
+0dd98b8 Touch controls: + and - clear of the Dynamic Island
+285c033 Settings: every Chinese glyph, and Minus is in the layout editor
+

@@ -1,0 +1,1081 @@
+// Forge's ImGui overlay: its "forge" window (About, Loaded Plugins, Plugin UI: each plugin's settings) and whatever
+// plugins draw every frame. On the console Forge draws it with its own NVN renderer onto the image about to be shown;
+// here Dear ImGui's Vulkan backend draws it into the window image, over the game (runtime/nvn/vulkan/device.c).
+//
+// Threads:
+//   - the game's thread builds the frame (runtime/forge.c's frame update, after the plugins' forge_onUpdate): the
+//     plugins' ImGui code runs there (their calls: runtime/forge_imgui.c); texture uploads too, under the Vulkan lock
+//   - the render thread draws a copy of the last frame's draw lists (taken under a lock of its own, so it never
+//     waits for plugin code)
+//   - the host's main thread passes input on: while the menu is open, keyboard and mouse go to ImGui, and the
+//     controller moves through the menu (runtime/host_input.c then gives the game none)
+// The menu opens and closes with the key of Forge's config (nativeNX/forge/config.ini [menu] key; Insert by default).
+// With a controller alone (an Android TV box): the settings' Mods tab opens it, over the settings, which wait under
+// it (g_forge_over); Cancel in the Forge window (nothing else to cancel) or Start + Back closes it, back to them.
+#include <algorithm>
+#include <atomic>
+#include <cfloat>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include "imgui.h"
+#include "imgui_internal.h"  // (the Forge window's Cancel: ImGui's active item, popups and nav window)
+#ifndef MHGU_NULL_BACKEND
+#include "backends/imgui_impl_vulkan.h"
+#else  // (no renderer: no overlay)
+struct ImGui_ImplVulkan_InitInfo { int unused; };
+static void ImGui_ImplVulkan_NewFrame() {}
+static void ImGui_ImplVulkan_UpdateTexture(ImTextureData *) {}
+#endif
+
+#include "config.h"
+#include "hdr_stats.h"
+#include "forge.h"
+#include "menu_confirm.h"
+#include "overlay.h"
+#include "touch.h"
+#include "hle/chat.h"
+#include "settings_locale.h"
+#include "settings_panel.h"
+
+extern "C" volatile uint64_t g_present_count;  // (runtime/rt.h: frames the game presented)
+
+#define LOG(...) fprintf(stderr, __VA_ARGS__)
+
+extern "C" {
+void vk_lock(void);
+void vk_unlock(void);
+SDL_Window *ui_window(void);
+bool shader_prewarm_progress(uint64_t *done, uint64_t *total);  // (runtime/nvn/vulkan/exec.c)
+bool romfs_mods_progress(int *done, int *total);                // (runtime/romfs.c)
+}
+
+static std::atomic<bool> g_enabled, g_ready, g_open, g_wants_text;
+static std::atomic<bool> g_settings_open, g_forge_open;
+static std::atomic<bool> g_forge_over;  // the Forge menu was opened from the settings: they wait under it, not drawn
+static std::mutex g_frame_lock;  // ImGui's frame: the game's thread, or the loading screen's before the game's first
+static int g_menu_key;
+static float g_font_size;
+static ImGuiStyle g_base_style;  // (unscaled; scaled copies follow the window's height)
+static float g_scale;
+
+// ------------------------------------------------------------------ input (main thread -> game thread)
+struct Ev {
+    enum { POS, BUTTON, WHEEL, KEY, TEXT, FOCUS, CLEAR } kind;
+    bool down;
+    bool touch;  // (POS, BUTTON: a finger's - ImGui then knows there was no hover before it, and none after it lifts)
+    int button;
+    float x, y;
+    ImGuiKey key;
+    SDL_Keymod mods;
+    char text[32];
+};
+static std::mutex g_in_lock;
+static std::vector<Ev> g_in;
+static OverlayPad g_pad;
+
+static void queue(const Ev &e) {
+    std::lock_guard<std::mutex> l(g_in_lock);
+    if (g_in.size() < 4096) g_in.push_back(e);
+}
+
+static ImGuiKey key_of(SDL_Scancode sc, SDL_Keycode kc) {
+    if (kc >= SDLK_A && kc <= SDLK_Z) return (ImGuiKey)(ImGuiKey_A + (int)(kc - SDLK_A));  // (letters as labelled)
+    if (sc >= SDL_SCANCODE_A && sc <= SDL_SCANCODE_Z) return (ImGuiKey)(ImGuiKey_A + (sc - SDL_SCANCODE_A));
+    if (sc >= SDL_SCANCODE_1 && sc <= SDL_SCANCODE_9) return (ImGuiKey)(ImGuiKey_1 + (sc - SDL_SCANCODE_1));
+    if (sc >= SDL_SCANCODE_F1 && sc <= SDL_SCANCODE_F12) return (ImGuiKey)(ImGuiKey_F1 + (sc - SDL_SCANCODE_F1));
+    if (sc >= SDL_SCANCODE_KP_1 && sc <= SDL_SCANCODE_KP_9) return (ImGuiKey)(ImGuiKey_Keypad1 + (sc - SDL_SCANCODE_KP_1));
+    switch (sc) {
+    case SDL_SCANCODE_0: return ImGuiKey_0;
+    case SDL_SCANCODE_TAB: return ImGuiKey_Tab;
+    case SDL_SCANCODE_LEFT: return ImGuiKey_LeftArrow;
+    case SDL_SCANCODE_RIGHT: return ImGuiKey_RightArrow;
+    case SDL_SCANCODE_UP: return ImGuiKey_UpArrow;
+    case SDL_SCANCODE_DOWN: return ImGuiKey_DownArrow;
+    case SDL_SCANCODE_PAGEUP: return ImGuiKey_PageUp;
+    case SDL_SCANCODE_PAGEDOWN: return ImGuiKey_PageDown;
+    case SDL_SCANCODE_HOME: return ImGuiKey_Home;
+    case SDL_SCANCODE_END: return ImGuiKey_End;
+    case SDL_SCANCODE_INSERT: return ImGuiKey_Insert;
+    case SDL_SCANCODE_DELETE: return ImGuiKey_Delete;
+    case SDL_SCANCODE_BACKSPACE: return ImGuiKey_Backspace;
+    case SDL_SCANCODE_SPACE: return ImGuiKey_Space;
+    case SDL_SCANCODE_RETURN: return ImGuiKey_Enter;
+    case SDL_SCANCODE_ESCAPE: return ImGuiKey_Escape;
+    case SDL_SCANCODE_APOSTROPHE: return ImGuiKey_Apostrophe;
+    case SDL_SCANCODE_COMMA: return ImGuiKey_Comma;
+    case SDL_SCANCODE_MINUS: return ImGuiKey_Minus;
+    case SDL_SCANCODE_PERIOD: return ImGuiKey_Period;
+    case SDL_SCANCODE_SLASH: return ImGuiKey_Slash;
+    case SDL_SCANCODE_SEMICOLON: return ImGuiKey_Semicolon;
+    case SDL_SCANCODE_EQUALS: return ImGuiKey_Equal;
+    case SDL_SCANCODE_LEFTBRACKET: return ImGuiKey_LeftBracket;
+    case SDL_SCANCODE_BACKSLASH: return ImGuiKey_Backslash;
+    case SDL_SCANCODE_RIGHTBRACKET: return ImGuiKey_RightBracket;
+    case SDL_SCANCODE_GRAVE: return ImGuiKey_GraveAccent;
+    case SDL_SCANCODE_CAPSLOCK: return ImGuiKey_CapsLock;
+    case SDL_SCANCODE_SCROLLLOCK: return ImGuiKey_ScrollLock;
+    case SDL_SCANCODE_NUMLOCKCLEAR: return ImGuiKey_NumLock;
+    case SDL_SCANCODE_PRINTSCREEN: return ImGuiKey_PrintScreen;
+    case SDL_SCANCODE_PAUSE: return ImGuiKey_Pause;
+    case SDL_SCANCODE_KP_0: return ImGuiKey_Keypad0;
+    case SDL_SCANCODE_KP_PERIOD: return ImGuiKey_KeypadDecimal;
+    case SDL_SCANCODE_KP_DIVIDE: return ImGuiKey_KeypadDivide;
+    case SDL_SCANCODE_KP_MULTIPLY: return ImGuiKey_KeypadMultiply;
+    case SDL_SCANCODE_KP_MINUS: return ImGuiKey_KeypadSubtract;
+    case SDL_SCANCODE_KP_PLUS: return ImGuiKey_KeypadAdd;
+    case SDL_SCANCODE_KP_ENTER: return ImGuiKey_KeypadEnter;
+    case SDL_SCANCODE_KP_EQUALS: return ImGuiKey_KeypadEqual;
+    case SDL_SCANCODE_LCTRL: return ImGuiKey_LeftCtrl;
+    case SDL_SCANCODE_LSHIFT: return ImGuiKey_LeftShift;
+    case SDL_SCANCODE_LALT: return ImGuiKey_LeftAlt;
+    case SDL_SCANCODE_LGUI: return ImGuiKey_LeftSuper;
+    case SDL_SCANCODE_RCTRL: return ImGuiKey_RightCtrl;
+    case SDL_SCANCODE_RSHIFT: return ImGuiKey_RightShift;
+    case SDL_SCANCODE_RALT: return ImGuiKey_RightAlt;
+    case SDL_SCANCODE_RGUI: return ImGuiKey_RightSuper;
+    case SDL_SCANCODE_APPLICATION: return ImGuiKey_Menu;
+    default: return ImGuiKey_None;
+    }
+}
+
+static void set_open(bool open) {
+    g_forge_open = open;
+    if (!open) g_forge_over = false;  // (the settings under it, if any, come back)
+    g_open = open || g_settings_open || settings_menu_open();
+    SDL_Window *w = ui_window();
+    if (g_open) SDL_ShowCursor();  // (full screen hides it: runtime/ui.c)
+    else if (w && (SDL_GetWindowFlags(w) & SDL_WINDOW_FULLSCREEN)) SDL_HideCursor();
+    Ev e = {};
+    e.kind = Ev::CLEAR;  // (keys and buttons held as it opens or closes: released)
+    queue(e);
+    LOG("[overlay] forge %s, settings %s\n", open ? "open" : "closed", g_settings_open ? "open" : "closed");
+}
+
+static std::atomic<int> g_face_positions[4] = {1, 0, 3, 2};
+void overlay_face_positions(const int positions[4]) {
+    for (int i = 0; i < 4; ++i) g_face_positions[i] = positions[i];
+}
+int overlay_face_position(int semantic) { return g_face_positions[semantic & 3]; }
+void overlay_request_close(void) {
+    settings_panel_request_close();
+    g_forge_over = false;  // (the exit question shows, beside the Forge window if it is open)
+    g_settings_open = true;
+    set_open(g_forge_open);
+}
+bool overlay_settings_dirty(void) { return settings_panel_dirty(); }
+void overlay_toggle_settings(void) {
+    if (!g_enabled) return;
+    if (settings_menu_open()) { settings_menu_toggle(); set_open(g_forge_open); return; }  // (one level back)
+    if (g_forge_over) { set_open(false); return; }  // (back to the settings under it)
+    if (g_settings_open) { settings_panel_request_back(); return; }
+    g_settings_open = true;
+    set_open(g_forge_open);
+}
+void overlay_toggle_menu(void) {
+    if (!g_enabled) return;
+    settings_menu_toggle();
+    set_open(g_forge_open);  // (the cursor and the held keys: as a menu opening or closing does)
+}
+bool overlay_panel_open(void) { return g_settings_open; }
+
+void overlay_menu_chord(void) {
+    if (!g_enabled) return;
+    if (g_forge_open && !g_settings_open) { set_open(false); return; }  // (Forge's menu alone: closed)
+    overlay_toggle_settings();
+}
+
+bool overlay_event(const SDL_Event *e) {
+    if (!g_enabled) return false;
+    if (e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat && settings_panel_key((int)e->key.scancode)) return true;
+    if (e->type == SDL_EVENT_MOUSE_BUTTON_DOWN && settings_panel_mouse(e->button.button)) return true;
+    if (e->type == SDL_EVENT_MOUSE_WHEEL &&
+        settings_panel_wheel(e->wheel.integer_y * (e->wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -1 : 1)))
+        return true;
+    if (e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat && e->key.scancode == SDL_SCANCODE_F1) {
+        overlay_toggle_settings();
+        return true;
+    }
+    if (e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat && (int)e->key.scancode == g_menu_key) {
+        set_open(!g_forge_open);
+        return true;
+    }
+    if (!overlay_menu_open()) return false;
+    SDL_Window *w = ui_window();
+    float density = w ? SDL_GetWindowPixelDensity(w) : 1.0f;  // (ImGui works in the image's pixels)
+    Ev v = {};
+    switch (e->type) {
+    case SDL_EVENT_MOUSE_MOTION:
+        v.kind = Ev::POS, v.x = e->motion.x * density, v.y = e->motion.y * density;
+        v.touch = e->motion.which == SDL_TOUCH_MOUSEID || !e->motion.timestamp;
+        break;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN: case SDL_EVENT_MOUSE_BUTTON_UP: {
+        static const int map[] = {-1, ImGuiMouseButton_Left, ImGuiMouseButton_Middle, ImGuiMouseButton_Right, 3, 4};
+        if (e->button.button >= 6 || map[e->button.button] < 0) return true;
+        v.kind = Ev::BUTTON, v.button = map[e->button.button], v.down = e->type == SDL_EVENT_MOUSE_BUTTON_DOWN;
+        v.x = e->button.x * density, v.y = e->button.y * density;
+        v.touch = e->button.which == SDL_TOUCH_MOUSEID || !e->button.timestamp;
+        break;
+    }
+    case SDL_EVENT_MOUSE_WHEEL:
+        v.kind = Ev::WHEEL, v.x = -e->wheel.x, v.y = e->wheel.y;
+        break;
+    case SDL_EVENT_KEY_DOWN: case SDL_EVENT_KEY_UP: {
+        v.kind = Ev::KEY, v.down = e->type == SDL_EVENT_KEY_DOWN, v.mods = e->key.mod;
+        v.key = key_of(e->key.scancode, e->key.key);
+        queue(v);
+        // the port's own keys still work (screenshots, Alt+Enter full screen)
+        bool port_key = (e->key.scancode >= SDL_SCANCODE_F1 && e->key.scancode <= SDL_SCANCODE_F12) ||
+                        ((e->key.scancode == SDL_SCANCODE_RETURN || e->key.scancode == SDL_SCANCODE_KP_ENTER) &&
+                         (e->key.mod & SDL_KMOD_ALT));
+        return !port_key;
+    }
+    case SDL_EVENT_TEXT_INPUT:
+        v.kind = Ev::TEXT;
+        SDL_strlcpy(v.text, e->text.text, sizeof v.text);
+        break;
+    case SDL_EVENT_WINDOW_FOCUS_LOST: case SDL_EVENT_WINDOW_FOCUS_GAINED:
+        v.kind = Ev::FOCUS, v.down = e->type == SDL_EVENT_WINDOW_FOCUS_GAINED;
+        queue(v);
+        return false;  // (the game's input sees it too)
+    default:
+        return false;
+    }
+    queue(v);
+    return true;
+}
+
+static bool g_pad_fresh;  // (g_in_lock) the host has given the controller since the last frame took it
+
+void overlay_pad(const OverlayPad *p) {
+    std::lock_guard<std::mutex> l(g_in_lock);
+    g_pad = *p;
+    g_pad_fresh = true;
+}
+
+bool overlay_enabled(void) { return g_enabled; }
+bool overlay_menu_open(void) { return g_open || settings_menu_open(); }
+bool overlay_wants_text(void) { return g_wants_text; }
+
+static void apply_input(ImGuiIO &io) {
+    std::vector<Ev> evs;
+    OverlayPad pad;
+    bool fresh;
+    {
+        std::lock_guard<std::mutex> l(g_in_lock);
+        evs.swap(g_in);
+        pad = g_pad;
+        fresh = g_pad_fresh;
+        g_pad_fresh = false;
+    }
+    for (const Ev &e : evs) {
+        switch (e.kind) {
+        case Ev::POS:
+            io.AddMouseSourceEvent(e.touch ? ImGuiMouseSource_TouchScreen : ImGuiMouseSource_Mouse);
+            io.AddMousePosEvent(e.x, e.y);
+            break;
+        case Ev::BUTTON:
+            io.AddMouseSourceEvent(e.touch ? ImGuiMouseSource_TouchScreen : ImGuiMouseSource_Mouse);
+            io.AddMousePosEvent(e.x, e.y);
+            io.AddMouseButtonEvent(e.button, e.down);
+            if (e.touch && !e.down) io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);  // (the finger is gone: nothing stays hovered)
+            break;
+        case Ev::WHEEL: io.AddMouseWheelEvent(e.x, e.y); break;
+        case Ev::KEY:
+            io.AddKeyEvent(ImGuiMod_Ctrl, (e.mods & SDL_KMOD_CTRL) != 0);
+            io.AddKeyEvent(ImGuiMod_Shift, (e.mods & SDL_KMOD_SHIFT) != 0);
+            io.AddKeyEvent(ImGuiMod_Alt, (e.mods & SDL_KMOD_ALT) != 0);
+            io.AddKeyEvent(ImGuiMod_Super, (e.mods & SDL_KMOD_GUI) != 0);
+            if (e.key != ImGuiKey_None) io.AddKeyEvent(e.key, e.down);
+            break;
+        case Ev::TEXT: io.AddInputCharactersUTF8(e.text); break;
+        case Ev::FOCUS: io.AddFocusEvent(e.down); break;
+        case Ev::CLEAR:
+            io.ClearInputKeys();
+            io.ClearInputMouse();
+            memset(&g_pad, 0, sizeof g_pad);
+            pad = {};
+            fresh = false;  // (the zeros above are no reading: a button held through it is still held)
+            break;
+        }
+    }
+    // the controller (as Forge maps it: A activates, B cancels, the left stick and the d-pad move)
+    if (!overlay_menu_open()) pad = {};
+    // Apply only to settings. Forge retains its existing semantic A/B mapping.
+    bool settings = (g_settings_open || settings_menu_open()) && !g_forge_over;  // (the settings have the controller)
+    if (settings) {
+        int a = overlay_face_position(0), b = overlay_face_position(1);
+        int confirm, cancel;
+        menu_confirm_buttons(config_live_menu_confirm(), a, b, pad.a, pad.b, &confirm, &cancel);
+        pad.a = confirm; pad.b = cancel;
+    }
+    // A or B held from the menu that had the controller (the settings' row that opened Forge's menu, Cancel that
+    // closed it) does nothing in the next one until let go: as the host reads the controller, not as the clear left it
+    static int last_policy = -1, was_owner;
+    static bool wait_release;
+    int owner = settings ? 1 : g_forge_open ? 2 : 0;
+    if (owner && owner != was_owner) wait_release = true;
+    was_owner = owner;
+    int policy = settings ? config_live_menu_confirm() : MENU_CONFIRM_ORIGINAL;
+    if (last_policy >= 0 && policy != last_policy) wait_release = true;
+    last_policy = policy;
+    if (wait_release) {
+        if (fresh && !pad.a && !pad.b) wait_release = false;
+        pad.a = pad.b = false;
+    }
+    io.AddKeyEvent(ImGuiKey_GamepadFaceDown, pad.a);
+    io.AddKeyEvent(ImGuiKey_GamepadFaceRight, pad.b);
+    io.AddKeyEvent(ImGuiKey_GamepadFaceUp, pad.x);
+    io.AddKeyEvent(ImGuiKey_GamepadFaceLeft, pad.y);
+    io.AddKeyEvent(ImGuiKey_GamepadDpadUp, pad.up);
+    io.AddKeyEvent(ImGuiKey_GamepadDpadDown, pad.down);
+    io.AddKeyEvent(ImGuiKey_GamepadDpadLeft, pad.left);
+    io.AddKeyEvent(ImGuiKey_GamepadDpadRight, pad.right);
+    io.AddKeyEvent(ImGuiKey_GamepadL1, pad.l);
+    io.AddKeyEvent(ImGuiKey_GamepadR1, pad.r);
+    io.AddKeyEvent(ImGuiKey_GamepadStart, pad.plus);
+    io.AddKeyEvent(ImGuiKey_GamepadBack, pad.minus);
+    auto axis = [&](ImGuiKey k, float v) { io.AddKeyAnalogEvent(k, v > 0.2f, std::min(v, 1.0f)); };
+    axis(ImGuiKey_GamepadLStickLeft, -pad.lx);
+    axis(ImGuiKey_GamepadLStickRight, pad.lx);
+    axis(ImGuiKey_GamepadLStickUp, pad.ly);
+    axis(ImGuiKey_GamepadLStickDown, -pad.ly);
+}
+
+// ------------------------------------------------------------------ setup
+static void forge_style(ImGuiStyle &style) {  // Forge's own (source/forge/graphics.cpp, Graphics::setupStyle)
+    style.WindowPadding = {12.0f, 12.0f};
+    style.WindowRounding = 2.0f;
+    style.WindowBorderSize = 1.0f;
+    style.WindowMinSize = {20.0f, 20.0f};
+    style.WindowTitleAlign = {0.5f, 0.5f};
+    style.WindowMenuButtonPosition = ImGuiDir_None;
+    style.ChildRounding = 0.0f;
+    style.ChildBorderSize = 1.0f;
+    style.PopupRounding = 0.0f;
+    style.PopupBorderSize = 1.0f;
+    style.FramePadding = {6.0f, 6.0f};
+    style.FrameRounding = 1.0f;
+    style.FrameBorderSize = 0.0f;
+    style.ItemSpacing = {12.0f, 6.0f};
+    style.ItemInnerSpacing = {6.0f, 3.0f};
+    style.CellPadding = {12.0f, 6.0f};
+    style.IndentSpacing = 20.0f;
+    style.ColumnsMinSpacing = 6.0f;
+    style.ScrollbarSize = 12.0f;
+    style.ScrollbarRounding = 0.0f;
+    style.GrabMinSize = 12.0f;
+    style.GrabRounding = 1.0f;
+    style.TabRounding = 0.0f;
+    style.TabBorderSize = 0.0f;
+    style.TabCloseButtonMinWidthUnselected = 0.0f;
+    style.ColorButtonPosition = ImGuiDir_Right;
+    style.ButtonTextAlign = {0.5f, 0.5f};
+    style.SelectableTextAlign = {0.0f, 0.0f};
+    const ImVec4 bg = {0.078f, 0.086f, 0.102f, 1.0f}, dark = {0.047f, 0.055f, 0.071f, 1.0f},
+                 frame = {0.118f, 0.133f, 0.149f, 1.0f}, line = {0.157f, 0.169f, 0.192f, 1.0f},
+                 hover = {0.196f, 0.176f, 0.545f, 1.0f}, active = {0.235f, 0.216f, 0.596f, 1.0f},
+                 accent = {0.498f, 0.514f, 1.0f, 1.0f}, bar = {0.098f, 0.106f, 0.122f, 1.0f},
+                 dim = {0.196f, 0.176f, 0.545f, 0.502f}, sep = {0.157f, 0.184f, 0.251f, 1.0f};
+    ImVec4 *c = style.Colors;
+    c[ImGuiCol_Text] = {1.0f, 1.0f, 1.0f, 1.0f};
+    c[ImGuiCol_TextDisabled] = {0.275f, 0.318f, 0.451f, 1.0f};
+    c[ImGuiCol_WindowBg] = c[ImGuiCol_ChildBg] = c[ImGuiCol_PopupBg] = c[ImGuiCol_BorderShadow] = bg;
+    c[ImGuiCol_Border] = line;
+    c[ImGuiCol_FrameBg] = frame;
+    c[ImGuiCol_FrameBgHovered] = line;
+    c[ImGuiCol_FrameBgActive] = active;
+    c[ImGuiCol_TitleBg] = c[ImGuiCol_TitleBgActive] = dark;
+    c[ImGuiCol_TitleBgCollapsed] = bg;
+    c[ImGuiCol_MenuBarBg] = bar;
+    c[ImGuiCol_ScrollbarBg] = dark;
+    c[ImGuiCol_ScrollbarGrab] = c[ImGuiCol_ScrollbarGrabActive] = frame;
+    c[ImGuiCol_ScrollbarGrabHovered] = line;
+    c[ImGuiCol_CheckMark] = c[ImGuiCol_SliderGrab] = accent;
+    c[ImGuiCol_SliderGrabActive] = {0.537f, 0.553f, 1.0f, 1.0f};
+    c[ImGuiCol_Button] = {0.257f, 0.267f, 0.554f, 1.0f};
+    c[ImGuiCol_ButtonHovered] = c[ImGuiCol_HeaderHovered] = c[ImGuiCol_ResizeGripHovered] = hover;
+    c[ImGuiCol_ButtonActive] = c[ImGuiCol_HeaderActive] = c[ImGuiCol_ResizeGripActive] = active;
+    c[ImGuiCol_Header] = c[ImGuiCol_ResizeGrip] = frame;
+    c[ImGuiCol_Separator] = c[ImGuiCol_SeparatorHovered] = c[ImGuiCol_SeparatorActive] = sep;
+    c[ImGuiCol_Tab] = c[ImGuiCol_TabDimmed] = dark;
+    c[ImGuiCol_TabHovered] = frame;
+    c[ImGuiCol_TabSelected] = bar;
+    c[ImGuiCol_TabDimmedSelected] = bg;
+    c[ImGuiCol_PlotLines] = {0.522f, 0.600f, 0.702f, 1.0f};
+    c[ImGuiCol_PlotLinesHovered] = {0.039f, 0.980f, 0.980f, 1.0f};
+    c[ImGuiCol_PlotHistogram] = {1.0f, 0.290f, 0.596f, 1.0f};
+    c[ImGuiCol_PlotHistogramHovered] = {0.996f, 0.475f, 0.698f, 1.0f};
+    c[ImGuiCol_TableHeaderBg] = c[ImGuiCol_TableBorderStrong] = dark;
+    c[ImGuiCol_TableBorderLight] = {0.0f, 0.0f, 0.0f, 1.0f};
+    c[ImGuiCol_TableRowBg] = frame;
+    c[ImGuiCol_TableRowBgAlt] = bar;
+    c[ImGuiCol_TextSelectedBg] = active;
+    c[ImGuiCol_DragDropTarget] = c[ImGuiCol_NavCursor] = c[ImGuiCol_NavWindowingHighlight] = accent;
+    c[ImGuiCol_NavWindowingDimBg] = c[ImGuiCol_ModalWindowDimBg] = dim;
+}
+
+// The context, ImGui's own font and Forge's style at 12 px: from the start (overlay_init_early), Forge's settings
+// once its config is read (overlay_init). (Under g_frame_lock: the loading screen may be drawing.)
+static ImFont *load_cjk_font(ImFontAtlas *atlas, float size);  // (defined below: the system font with Chinese)
+static void context_init(const char *font_path, float font_size) {
+    if (!ImGui::GetCurrentContext()) {
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+        ImGuiIO &io = ImGui::GetIO();
+        io.IniFilename = "forge_imgui.ini";  // (window positions; in the game folder, beside mhgurecomp.ini)
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
+        io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+        io.BackendPlatformName = "mhgurecomp";
+    }
+    ImGuiIO &io = ImGui::GetIO();
+    g_font_size = font_size > 0 ? font_size : 12.0f;
+    ImFontConfig cfg;
+    cfg.SizePixels = g_font_size;
+    ImFont *font = font_path ? io.Fonts->AddFontFromFileTTF(font_path, g_font_size, &cfg) : nullptr;
+    if (!font && io.Fonts->Fonts.Size == 0) font = load_cjk_font(io.Fonts, g_font_size);
+    if (font) io.FontDefault = font;
+    else if (io.Fonts->Fonts.Size == 0) io.Fonts->AddFontDefaultVector(&cfg);
+    ImGuiStyle style;
+    ImGui::StyleColorsDark(&style);
+    forge_style(style);
+    style.FontSizeBase = g_font_size;
+    ImGui::GetStyle() = g_base_style = style;
+    g_scale = 0;  // (frame_setup scales it again)
+}
+
+void overlay_init_early(void) {
+#ifndef MHGU_NULL_BACKEND
+    std::lock_guard<std::mutex> l(g_frame_lock);
+    context_init(nullptr, 0);
+    g_enabled = true;
+#endif
+}
+
+// A font with the Chinese the menu can show ([Application] Language): none is shipped, so the system's own - ImGui
+// 1.92 rasterizes the glyphs it needs as the text is drawn, so no glyph range is set here. A font set in Forge's
+// config still wins. The .ttc files hold several faces (SC, TC, HK): the first that opens is used.
+static ImFont *load_cjk_font(ImFontAtlas *atlas, float size) {
+    static const char *const paths[] = {
+#ifdef __APPLE__
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/LanguageSupport/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+#elif defined(__ANDROID__)
+        "/system/fonts/NotoSansCJK-Regular.ttc",
+        "/system/fonts/NotoSansSC-Regular.otf",
+        "/system/fonts/NotoSansCJKsc-Regular.otf",
+        "/system/fonts/DroidSansFallback.ttf",
+#elif defined(_WIN32)
+        "C:/Windows/Fonts/msyh.ttc",
+        "C:/Windows/Fonts/simhei.ttf",
+#else
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+#endif
+    };
+    // (the app's own: a subset of Noto Sans SC (SIL OFL), ios/FontSC.ttf, packed beside the executable by
+    // .github/workflows/build-ios.yml - the system's fonts are in the dyld cache on iOS, not on disk)
+    static char own[1024];
+    const char *base = SDL_GetBasePath();
+    if (base && *base) snprintf(own, sizeof own, "%sFontSC.ttf", base);
+    const char *all[12];
+    int n = 0;
+    if (own[0]) all[n++] = own;
+    for (const char *p : paths)
+        if (n < 11) all[n++] = p;
+    for (int i = 0; i < n; i++) {
+        const char *path = all[i];
+        FILE *f = fopen(path, "rb");
+        if (!f) continue;
+        fclose(f);
+        for (int no = 0; no < 4; no++) {
+            ImFontConfig fc;
+            fc.SizePixels = size;
+            fc.FontNo = (ImU32)no;  // (.ttc: face 0 is the one wanted, when there is more than one)
+            if (ImFont *font = atlas->AddFontFromFileTTF(path, size, &fc)) {
+                LOG("[overlay] font: %s (face %d)\n", path, no);
+                return font;
+            }
+        }
+    }
+    LOG("[overlay] no font with Chinese found: only the Latin text draws\n");
+    return nullptr;
+}
+
+void overlay_init(const char *font_path, float font_size, int menu_key) {
+#ifdef MHGU_NULL_BACKEND
+    return;
+#endif
+    std::lock_guard<std::mutex> l(g_frame_lock);
+    context_init(font_path, font_size);
+    bool font = font_path && ImGui::GetIO().FontDefault;
+    g_menu_key = menu_key;
+    g_enabled = true;
+    LOG("[forge] ImGui %s overlay: %s opens the menu (font %s, %.0f px)\n", IMGUI_VERSION,
+        SDL_GetScancodeName((SDL_Scancode)menu_key), font ? font_path : "ImGui's", g_font_size);
+}
+
+// ------------------------------------------------------------------ notices (any thread -> game thread)
+// A few seconds at the top of the screen, menus open or not (runtime/net/ldn.c: the hub server's failures). Drawn on
+// the foreground draw list: over every window, taking no input or focus.
+static std::mutex g_notice_lock;
+static std::string g_notice_title, g_notice_text;
+static uint64_t g_notice_ns;  // when it came (SDL_GetTicksNS); 0: none
+static const uint64_t NOTICE_NS = 7000000000ull;
+
+void overlay_notice(const char *title, const char *text) {
+    std::lock_guard<std::mutex> l(g_notice_lock);
+    g_notice_title = title ? title : "";
+    g_notice_text = text ? text : "";
+    g_notice_ns = std::max<uint64_t>(SDL_GetTicksNS(), 1);
+}
+
+static bool notice_due(uint64_t now) {
+    std::lock_guard<std::mutex> l(g_notice_lock);
+    if (g_notice_ns && now - g_notice_ns >= NOTICE_NS) g_notice_ns = 0;
+    return g_notice_ns != 0;
+}
+
+static void draw_notice(uint64_t now, float scale) {
+    std::string title, text;
+    uint64_t at;
+    {
+        std::lock_guard<std::mutex> l(g_notice_lock);
+        if (!g_notice_ns) return;
+        title = g_notice_title, text = g_notice_text, at = g_notice_ns;
+    }
+    float age = (now - at) / 1e9f, alpha = std::clamp(std::min(age / .15f, (NOTICE_NS / 1e9f - age) / .5f), 0.f, 1.f);
+    auto color = [alpha](float r, float g, float b, float a) {
+        return ImGui::ColorConvertFloat4ToU32(ImVec4(r, g, b, a * alpha));
+    };
+    ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImFont *font = ImGui::GetFont();
+    float size = ImGui::GetFontSize() * 1.25f, pad = 10 * scale, bar = 4 * scale, gap = 3 * scale;
+    float wrap = std::min(vp->WorkSize.x * .6f, 620 * scale);
+    ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, wrap, title.c_str());
+    ImVec2 xs = font->CalcTextSizeA(size, FLT_MAX, wrap, text.c_str());
+    float w = std::max(ts.x, xs.x) + bar + 2 * pad, h = ts.y + gap + xs.y + 2 * pad;
+    ImVec2 p0(vp->WorkPos.x + (vp->WorkSize.x - w) * .5f, vp->WorkPos.y + 20 * scale), p1(p0.x + w, p0.y + h);
+    ImDrawList *dl = ImGui::GetForegroundDrawList();
+    dl->AddRectFilled(p0, p1, color(.025f, .04f, .065f, .92f), 6 * scale);
+    dl->AddRectFilled(p0, ImVec2(p0.x + bar, p1.y), color(1, .72f, .3f, 1), 6 * scale, ImDrawFlags_RoundCornersLeft);
+    ImVec2 at_text(p0.x + bar + pad, p0.y + pad);
+    dl->AddText(font, size, at_text, color(1, .8f, .45f, 1), title.c_str(), nullptr, wrap);
+    dl->AddText(font, size, ImVec2(at_text.x, at_text.y + ts.y + gap), color(.96f, .97f, 1, 1), text.c_str(), nullptr, wrap);
+}
+
+// The line of chat being typed ("/", runtime/hle/chat.c): where the player dragged it (at first above the game's
+// chat window), wrapped
+static void draw_chat(const char *line, uint64_t now, float scale) {
+    ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImFont *font = ImGui::GetFont();
+    float size = ImGui::GetFontSize() * 1.25f, pad = 8 * scale, bar = 4 * scale;
+    std::string text = std::string("Chat: ") + line + ((now / 500000000ull) & 1 ? "_" : " ");
+    float wrap = std::min(vp->WorkSize.x * .45f, 560 * scale);  // (a long line wraps; the box grows upwards)
+    ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, wrap, text.c_str());
+    float w = std::max(ts.x, 320 * scale) + bar + 2 * pad, h = ts.y + 2 * pad;
+    float left, low;
+    chat_position(&left, &low);
+    float bottom = vp->WorkPos.y + vp->WorkSize.y * low;
+    ImVec2 p0(vp->WorkPos.x + vp->WorkSize.x * left, bottom - h), p1(p0.x + w, bottom);
+    chat_set_box((p0.x - vp->WorkPos.x) / vp->WorkSize.x, (p0.y - vp->WorkPos.y) / vp->WorkSize.y,
+                 (p1.x - vp->WorkPos.x) / vp->WorkSize.x, (p1.y - vp->WorkPos.y) / vp->WorkSize.y);
+    ImDrawList *dl = ImGui::GetForegroundDrawList();
+    // In the settings menu's colours ([Application] Theme, runtime/settings_panel.cpp theme()): Blue and Gold a panel
+    // with a bar at its left, Hunter the game's window with a red and green rule along its top and bottom
+    int theme = settings_panel_theme();
+    if (theme == THEME_HUNTER) {
+        float line = 2 * scale;
+        dl->AddRectFilled(p0, p1, IM_COL32(50, 25, 24, 236));
+        dl->AddRect(p0, p1, IM_COL32(0, 0, 0, 255), 0, 0, 2 * scale);
+        dl->AddRectFilled(p0, ImVec2(p1.x, p0.y + line), IM_COL32(176, 34, 30, 255));
+        dl->AddRectFilled(ImVec2(p0.x, p0.y + line), ImVec2(p1.x, p0.y + line * 1.7f), IM_COL32(80, 142, 54, 255));
+        dl->AddRectFilled(ImVec2(p0.x, p1.y - line * 1.7f), ImVec2(p1.x, p1.y - line), IM_COL32(80, 142, 54, 255));
+        dl->AddRectFilled(ImVec2(p0.x, p1.y - line), p1, IM_COL32(176, 34, 30, 255));
+    } else {
+        bool gold = theme == THEME_GOLD;
+        dl->AddRectFilled(p0, p1, gold ? IM_COL32(34, 25, 19, 240) : IM_COL32(6, 10, 17, 235), 6 * scale);
+        dl->AddRectFilled(p0, ImVec2(p0.x + bar, p1.y), gold ? IM_COL32(213, 162, 79, 255) : IM_COL32(111, 216, 255, 255),
+                          6 * scale, ImDrawFlags_RoundCornersLeft);
+    }
+    ImU32 ink = theme == THEME_GOLD ? IM_COL32(242, 216, 170, 255) : IM_COL32(244, 247, 252, 255);
+    dl->AddText(font, size, ImVec2(p0.x + bar + pad, p0.y + pad), ink, text.c_str(), nullptr, wrap);
+}
+
+// The battery's charge, "87%" ("87% +" while charging); false when there is no battery to tell of (a desktop PC). Asked
+// every few seconds: SDL goes through Java on Android.
+static bool battery_text(uint64_t now, char *out, size_t size) {
+    static uint64_t last;
+    static int percent = -1;
+    static bool charging;
+    if (!last || now - last >= 5000000000ull) {
+        last = now;
+        int secs;
+        SDL_PowerState st = SDL_GetPowerInfo(&secs, &percent);
+        charging = st == SDL_POWERSTATE_CHARGING || st == SDL_POWERSTATE_CHARGED;
+        if (st == SDL_POWERSTATE_NO_BATTERY || st == SDL_POWERSTATE_ERROR) percent = -1;
+    }
+    if (percent < 0) return false;
+    snprintf(out, size, "%d%%%s", percent, charging ? " +" : "");
+    return true;
+}
+
+// The frame rate ([Performance] ShowFPS): frames the game presented, counted over half a second. An ImGui window of
+// its own, so it can be dragged while the settings menu (which gets the mouse) is open; ImGui keeps where it was put in
+// forge_imgui.ini. With ShowBattery = WithFPS the battery's charge is in it; ByItself: a window of its own.
+static void draw_fps(uint64_t now) {
+    static uint64_t t0, f0;
+    static float fps, ms;
+    uint64_t frames = g_present_count;
+    if (!t0 || frames < f0) t0 = now, f0 = frames;
+    if (now - t0 >= 500000000ull) {
+        uint64_t n = frames - f0;
+        fps = n * 1e9f / (float)(now - t0);
+        ms = n ? (now - t0) / 1e6f / n : 0;
+        t0 = now, f0 = frames;
+    }
+#ifdef __ANDROID__  // (a phone's battery: the Android tab's setting)
+    int battery = config_show_battery();
+#else
+    int battery = BATTERY_OFF;
+#endif
+    char charge[32];
+    bool have_charge = battery != BATTERY_OFF && battery_text(now, charge, sizeof charge);
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                             ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
+    if (config_show_fps()) {
+        ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowBgAlpha(0.6f);
+        if (ImGui::Begin("FPS##counter", nullptr, flags)) {
+            if (have_charge && battery == BATTERY_WITH_FPS) ImGui::Text("%.0f FPS  %.1f ms  %s", fps, ms, charge);
+            else ImGui::Text("%.0f FPS  %.1f ms", fps, ms);
+        }
+        ImGui::End();
+    }
+    if (have_charge && battery == BATTERY_ALONE) {
+        ImGui::SetNextWindowPos(ImVec2(10, 50), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowBgAlpha(0.6f);
+        if (ImGui::Begin("Battery##counter", nullptr, flags)) ImGui::Text("%s", charge);
+        ImGui::End();
+    }
+}
+
+// ------------------------------------------------------------------ HDR analysis ([HDR] Analysis)
+// Lilium's HDR analysis, roughly: the picture's nits and gamut in the top left, a waveform (brightness by screen
+// column, log scale) in the bottom right, from what the GPU measured (nvn/vulkan/hdr.c vk_hdr_analyze). Drawn at UI
+// brightness and not measured itself.
+static HdrStats g_hdr_stats;
+static void draw_hdr_analysis(const HdrStats &st, float scale) {
+    ImGuiIO &io = ImGui::GetIO();
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                             ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs;
+    float top = config_show_fps() ? 50 * scale : 10 * scale;
+    ImGui::SetNextWindowPos(ImVec2(10 * scale, top), ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.6f);
+    if (ImGui::Begin("HDR analysis##stats", nullptr, flags)) {
+        ImGui::Text("HDR analysis (%s)", st.pq ? "HDR10" : "scRGB");
+        ImGui::Text("        %10s %10s", "nits", "CLL");
+        ImGui::Text("max     %10.2f %10.2f", st.max_nits, st.max_cll);
+        ImGui::Text("avg     %10.2f %10.2f", st.avg_nits, st.avg_cll);
+        ImGui::Text("min     %10.4f", st.min_nits);
+        ImGui::Text("centre  %10.2f %10.2f", st.center_nits, st.center_cll);
+        ImGui::Text("BT.709  %9.3f%%", st.bt709);
+        ImGui::Text("DCI-P3  %9.3f%%", st.p3);
+        ImGui::Text("BT.2020 %9.3f%%", st.bt2020);
+        if (st.outside > 0) ImGui::Text("outside %9.3f%%", st.outside);
+        ImGui::Text("peak %.0f  game %.0f  UI %.0f", st.peak, st.game, st.ui);
+    }
+    ImGui::End();
+    // the centre's spot
+    ImDrawList *dl = ImGui::GetForegroundDrawList();
+    ImVec2 c(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
+    float r = 6 * scale;
+    dl->AddLine(ImVec2(c.x - r, c.y), ImVec2(c.x + r, c.y), IM_COL32(255, 255, 255, 160), 1.0f);
+    dl->AddLine(ImVec2(c.x, c.y - r), ImVec2(c.x, c.y + r), IM_COL32(255, 255, 255, 160), 1.0f);
+    // the waveform
+    float gw = io.DisplaySize.x * 0.34f, gh = io.DisplaySize.y * 0.30f, label = ImGui::CalcTextSize("10000").x + 8 * scale;
+    ImVec2 p1(io.DisplaySize.x - 10 * scale, io.DisplaySize.y - 10 * scale), p0(p1.x - gw, p1.y - gh);
+    dl->AddRectFilled(ImVec2(p0.x - label, p0.y - 4 * scale), ImVec2(p1.x + 4 * scale, p1.y + 4 * scale), IM_COL32(0, 0, 0, 170));
+    auto y_of = [&](float nits) {
+        float v = (log10f(fmaxf(nits, 1e-6f)) - HDR_WF_LO) / (HDR_WF_HI - HDR_WF_LO);
+        return p1.y - fminf(fmaxf(v, 0.f), 1.f) * gh;
+    };
+    static const float marks[] = {0.01f, 0.05f, 0.25f, 1, 2.5f, 10, 25, 100, 400, 1000, 4000, 10000};
+    for (float m : marks) {
+        float y = y_of(m);
+        dl->AddLine(ImVec2(p0.x, y), ImVec2(p1.x, y), IM_COL32(255, 255, 255, 40));
+        char t[16];
+        snprintf(t, sizeof t, m < 1 ? "%.2f" : m < 10 && m != floorf(m) ? "%.1f" : "%.0f", m);
+        dl->AddText(ImVec2(p0.x - label + 2 * scale, y - ImGui::GetFontSize() * 0.5f), IM_COL32(200, 200, 200, 255), t);
+    }
+    float cw = gw / HDR_WF_W, ch = gh / HDR_WF_H, lmax = logf(1.0f + (float)st.wf_max);
+    for (int row = 0; row < HDR_WF_H; row++)
+        for (int col = 0; col < HDR_WF_W; col++) {
+            uint32_t v = st.wf[row][col];
+            if (!v) continue;
+            float a = lmax > 0 ? logf(1.0f + (float)v) / lmax : 1.0f;
+            int alpha = (int)(60 + 195 * a);
+            ImVec2 q0(p0.x + col * cw, p1.y - (row + 1) * ch);
+            dl->AddRectFilled(q0, ImVec2(q0.x + cw + 0.5f, q0.y + ch + 0.5f), IM_COL32(255, 255, 255, alpha));
+        }
+    float yp = y_of(st.peak), yg = y_of(st.game);  // (the peak: red; the game's white: yellow)
+    dl->AddLine(ImVec2(p0.x, yp), ImVec2(p1.x, yp), IM_COL32(255, 60, 60, 220), 1.5f);
+    dl->AddLine(ImVec2(p0.x, yg), ImVec2(p1.x, yg), IM_COL32(255, 210, 60, 160), 1.0f);
+}
+
+// ------------------------------------------------------------------ loading indicator
+// A spinner and "Loading" in the bottom right corner, with the mods' count while romfs.c layers them and then the
+// shader prewarm's while it runs: on the black
+// window until the game's first frame (overlay_loading: device.c's loading screen), then over the game while the
+// prewarm still has programs left, and for the game's first second at least (its own first frames are black too).
+// Then it fades and stays gone. (Under g_frame_lock: the loading screen's thread and the game's both draw it.)
+static const uint64_t LOADING_HOLD_NS = 1000000000ull, LOADING_FADE_NS = 400000000ull;
+static uint64_t g_loading_t0, g_loading_fade;  // the game's first overlay frame; when the fade began (0: not yet)
+static bool g_loading_over;
+
+static float loading_alpha(uint64_t now) {  // (the game's frames)
+    if (!g_config.loading_indicator) g_loading_over = true;  // ([Performance] LoadingIndicator = Off: never)
+    if (g_loading_over) return 0;
+    if (!g_loading_t0) g_loading_t0 = now;
+    if (!g_loading_fade && now - g_loading_t0 >= LOADING_HOLD_NS && !shader_prewarm_progress(nullptr, nullptr))
+        g_loading_fade = now;
+    if (!g_loading_fade) return 1;
+    float a = 1 - (now - g_loading_fade) / (float)LOADING_FADE_NS;
+    if (a <= 0) g_loading_over = true;
+    return std::max(a, 0.0f);
+}
+
+static void draw_loading(uint64_t now, float scale, float alpha) {
+    auto color = [alpha](float r, float g, float b, float a) {
+        return ImGui::ColorConvertFloat4ToU32(ImVec4(r, g, b, a * alpha));
+    };
+    int language = config_language();
+    const char *title = settings_text(language, "Loading");
+    uint64_t done, total;
+    int mods_done, mods_total;
+    char line[128] = "", widest[128] = "";
+    if (romfs_mods_progress(&mods_done, &mods_total)) {  // (before the game's first frame: a big mod can take a while)
+        if (!mods_total) {
+            snprintf(line, sizeof line, "%s  %d %s", settings_text(language, "Reading mods"), mods_done,
+                     settings_text(language, "files"));
+            snprintf(widest, sizeof widest, "%s", line);
+        } else {
+            const char *what = settings_text(language, "Applying mods");
+            snprintf(line, sizeof line, "%s  %d / %d", what, mods_done, mods_total);
+            snprintf(widest, sizeof widest, "%s  %d / %d", what, mods_total, mods_total);
+        }
+    } else if (shader_prewarm_progress(&done, &total) && total) {
+        const char *what = settings_text(language, "Compiling shaders");
+        snprintf(line, sizeof line, "%s  %llu / %llu", what, (unsigned long long)done, (unsigned long long)total);
+        snprintf(widest, sizeof widest, "%s  %llu / %llu", what, (unsigned long long)total, (unsigned long long)total);
+    }
+    ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImFont *font = ImGui::GetFont();
+    float size = ImGui::GetFontSize() * 1.25f, small = ImGui::GetFontSize(), pad = 10 * scale, gap = 3 * scale;
+    float r = size * 0.55f, margin = 24 * scale;
+    ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, 0, title);
+    ImVec2 ls = line[0] ? font->CalcTextSizeA(small, FLT_MAX, 0, widest) : ImVec2(0, 0);  // (no jitter as it counts)
+    float w = pad + 2 * r + pad + std::max(ts.x, ls.x) + pad, h = pad + ts.y + (line[0] ? gap + ls.y : 0) + pad;
+    ImVec2 p1(vp->WorkPos.x + vp->WorkSize.x - margin, vp->WorkPos.y + vp->WorkSize.y - margin), p0(p1.x - w, p1.y - h);
+    ImDrawList *dl = ImGui::GetForegroundDrawList();
+    dl->AddRectFilled(p0, p1, color(.025f, .04f, .065f, .85f), 6 * scale);
+    ImVec2 c(p0.x + pad + r, (p0.y + p1.y) * 0.5f);  // (a three-quarter ring, once round a second)
+    const float pi = 3.14159265f;
+    float a0 = (float)(now % 1000000000ull) / 1e9f * 2 * pi;
+    dl->PathArcTo(c, r, a0, a0 + pi * 1.5f, 32);
+    dl->PathStroke(color(1, .72f, .3f, 1), ImDrawFlags_None, 3 * scale);
+    ImVec2 at(c.x + r + pad, p0.y + pad);
+    dl->AddText(font, size, at, color(.96f, .97f, 1, 1), title);
+    if (line[0]) dl->AddText(font, small, ImVec2(at.x, at.y + ts.y + gap), color(.72f, .76f, .84f, 1), line);
+}
+
+// ------------------------------------------------------------------ frames (game thread)
+static std::mutex g_snap_lock;  // the copy the render thread draws
+static ImDrawData g_snap;
+static std::atomic<uint32_t> g_disp_w, g_disp_h;
+static bool g_plugins_init;
+static uint64_t g_last_ns;
+
+// The display's size and scale, the style scaled to it, the time step (under g_frame_lock)
+static float frame_setup(ImGuiIO &io, uint32_t w, uint32_t h, uint64_t now) {
+    io.DisplaySize = ImVec2((float)w, (float)h);
+    io.DisplayFramebufferScale = ImVec2(1, 1);
+    float scale = std::max(1.0f, h / 720.0f);  // (Forge's sizes are for the console's 720p screen)
+    if (scale != g_scale) {
+        ImGuiStyle &style = ImGui::GetStyle();
+        style = g_base_style;
+        style.ScaleAllSizes(scale);
+        style.FontScaleDpi = scale;
+        g_scale = scale;
+    }
+    io.DeltaTime = g_last_ns ? std::clamp((now - g_last_ns) / 1e9f, 1e-4f, 0.1f) : 1.0f / 30;
+    g_last_ns = now;
+    return scale;
+}
+
+static void snap_clear(void) {
+    for (ImDrawList *l : g_snap.CmdLists) IM_DELETE(l);
+    g_snap.CmdLists.resize(0);
+    g_snap.CmdListsCount = g_snap.TotalIdxCount = g_snap.TotalVtxCount = 0;
+    g_snap.Valid = false;
+}
+
+// A texture ImGui wants made whose descriptor set could not be had (VK_ERROR_OUT_OF_POOL_MEMORY: the backend's pool
+// full). The backend still made its image, gave it a null set and marked it ready, and the next draw naming it
+// asserts ("ImDrawCmd is referring to ImTextureData that wasn't uploaded"). Undo it and ask again next frame, by
+// when textures ImGui let go of (an outgrown font atlas: freed after ImageCount frames) have freed their sets.
+// VkOverlayTex: the backend's ImGui_ImplVulkan_Texture (imgui_impl_vulkan.cpp, internal to it), field for field.
+#ifndef MHGU_NULL_BACKEND
+struct VkOverlayTex { VkDeviceMemory memory; VkImage image; VkImageView view; VkDescriptorSet set; };
+static VkDevice g_dev;
+static bool tex_create_failed(ImTextureData *tex) {
+    VkOverlayTex *bt = (VkOverlayTex *)tex->BackendUserData;
+    if (!bt || bt->set != VK_NULL_HANDLE) return false;
+    static int logged;
+    if (logged++ < 8) LOG("[forge] ImGui texture %dx%d: no descriptor set free, again next frame\n", tex->Width, tex->Height);
+    vkDestroyImageView(g_dev, bt->view, nullptr);
+    vkDestroyImage(g_dev, bt->image, nullptr);
+    vkFreeMemory(g_dev, bt->memory, nullptr);
+    IM_FREE(bt);
+    tex->BackendUserData = nullptr;
+    tex->SetStatus(ImTextureStatus_WantCreate);
+    return true;
+}
+#else
+static bool tex_create_failed(ImTextureData *) { return false; }
+#endif
+
+void overlay_frame(void *cpu) {
+    if (!g_ready) return;
+    std::lock_guard<std::mutex> frame(g_frame_lock);
+    if (!g_settings_open) { bool closed = false; settings_panel(&closed); }
+    bool open = g_open || settings_menu_open(), free_render = forge_plugins_have(FORGE_IMGUI_FREE_RENDER);
+    uint64_t now = SDL_GetTicksNS();
+    bool notice = notice_due(now);
+    char line[256];
+    bool chat = chat_composing(line, sizeof line);
+    ImGuiIO &io = ImGui::GetIO();
+    g_wants_text = open && io.WantTextInput;  // (as of the last frame; the window side reads it: runtime/textinput.c)
+#ifdef __ANDROID__
+    bool fps = config_show_fps() || config_show_battery() == BATTERY_ALONE;
+#else
+    bool fps = config_show_fps();
+#endif
+    float loading = loading_alpha(now);
+#ifndef MHGU_NULL_BACKEND
+    bool hdr_stats = vk_hdr_stats(&g_hdr_stats);
+#else
+    bool hdr_stats = false;
+#endif
+    bool touch = touch_drawn();  // (the touch controls: hidden, the settings button alone still shows)
+    if (!open && !free_render && !notice && !chat && !fps && !loading && !hdr_stats && !touch) {  // (nothing to draw)
+        std::lock_guard<std::mutex> l(g_snap_lock);
+        if (g_snap.Valid) snap_clear();
+        apply_input(io);  // (keep the queue short)
+        g_last_ns = 0;
+        return;
+    }
+    uint32_t w = g_disp_w, h = g_disp_h;
+    if (!w || !h) return;
+    float scale = frame_setup(io, w, h, now);
+    apply_input(io);
+
+    if (!g_plugins_init) {  // (Forge: right after its context is made)
+        g_plugins_init = true;
+        forge_imgui_init(cpu);
+    }
+    ImGui_ImplVulkan_NewFrame();
+    // Cancel in the Forge window closes it when there is nothing else in it to cancel (an item being edited, a popup,
+    // a child window): as of before this frame's NewFrame, which acts on Cancel
+    ImGuiContext &g = *ImGui::GetCurrentContext();
+    bool forge_idle = g_forge_open && g.ActiveId == 0 && g.OpenPopupStack.Size == 0 && g.NavWindow &&
+                      g.NavWindow == g.NavWindow->RootWindow && !strcmp(g.NavWindow->Name, "forge");
+    bool under = g_forge_over;  // (the settings wait under Forge's menu: neither drawn nor given input)
+    if (!under) settings_panel_before_frame(g_settings_open);
+    ImGui::NewFrame();
+    if (!under) {
+        bool settings = g_settings_open;
+        settings_panel(&settings);
+        if (settings_panel_confirming()) settings = true;
+        if (settings != g_settings_open) { g_settings_open = settings; set_open(g_forge_open); }
+        // the in-game menu (menupop): over the game, above the touch controls, under Forge's window
+        if (settings_menu_take_more()) { settings_menu_toggle(); overlay_toggle_settings(); }
+        if (settings_menu_open() && !settings_menu_draw((float)w, (float)h)) set_open(g_forge_open);
+        if (settings_panel_take_forge() && g_settings_open) {
+            g_forge_over = true;
+            set_open(true);
+            ImGui::SetNextWindowFocus();  // (the controller moves in it, even if it was open beside the settings)
+        }
+    }
+    if (g_forge_open) {
+        bool keep = true;
+        if (forge_idle && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)) keep = false;
+        ImGui::SetNextWindowPos(ImVec2(40 * scale, 40 * scale), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(420 * scale, 360 * scale), ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("forge", &keep)) {
+            if (ImGui::CollapsingHeader("About Forge")) {
+                ImGui::Text("Version: %s", "1.5.1");
+                ImGui::SeparatorText("Developers");
+                ImGui::BulletText("Fexty");
+                ImGui::BulletText("jeffi2287");
+
+                ImGui::SeparatorText("Libraries Used");
+                ImGui::BulletText("devkitARM/libnx (32-bit)");
+                ImGui::BulletText("NNSDK");
+                ImGui::BulletText("switch-tools");
+                ImGui::BulletText("iniparser");
+                ImGui::BulletText("Dear ImGui");
+            }
+            if (ImGui::CollapsingHeader("Loaded Plugins")) {
+                const char *names[16];
+                int n = forge_plugin_titles(names, 16);
+                for (int i = 0; i < n; i++) ImGui::BulletText("%s", names[i]);
+            }
+            if (ImGui::CollapsingHeader("Plugin UI")) forge_imgui_run(cpu, FORGE_IMGUI_RENDER);
+        }
+        ImGui::End();
+        if (!keep) set_open(false);
+    }
+    forge_imgui_run(cpu, FORGE_IMGUI_FREE_RENDER);
+    if (notice) draw_notice(now, scale);
+    if (chat) draw_chat(line, now, scale);
+    if (fps) draw_fps(now);
+    if (hdr_stats) draw_hdr_analysis(g_hdr_stats, scale);
+    if (loading) draw_loading(now, scale, loading);
+    if (touch) touch_draw((float)w, (float)h);  // (the touch controls: runtime/touch.cpp)
+    ImGui::Render();
+
+    ImDrawData *dd = ImGui::GetDrawData();
+    bool tex_failed = false;
+    if (dd->Textures)  // (texture uploads: on this thread, between the render thread's submissions)
+        for (ImTextureData *tex : *dd->Textures)
+            if (tex->Status != ImTextureStatus_OK) {
+                bool create = tex->Status == ImTextureStatus_WantCreate;
+                vk_lock();
+                ImGui_ImplVulkan_UpdateTexture(tex);
+                if (create && tex->TexID == ImTextureID_Invalid) tex_failed |= tex_create_failed(tex);
+                vk_unlock();
+            }
+    std::lock_guard<std::mutex> l(g_snap_lock);
+    snap_clear();
+    if (tex_failed) return;  // (nothing drawn this frame: a draw naming a texture with no descriptor set is an assert)
+    for (ImDrawList *list : dd->CmdLists) g_snap.CmdLists.push_back(list->CloneOutput());
+    g_snap.CmdListsCount = dd->CmdListsCount;
+    g_snap.TotalIdxCount = dd->TotalIdxCount;
+    g_snap.TotalVtxCount = dd->TotalVtxCount;
+    g_snap.DisplayPos = dd->DisplayPos;
+    g_snap.DisplaySize = dd->DisplaySize;
+    g_snap.FramebufferScale = dd->FramebufferScale;
+    g_snap.Textures = nullptr;  // (done above)
+    g_snap.Valid = true;
+}
+
+// ------------------------------------------------------------------ drawing (render thread)
+static VkRenderPass g_pass;
+
+static void vk_check(VkResult r) {
+    if (r < 0) LOG("[forge] ImGui Vulkan error %d\n", (int)r);
+}
+
+#ifndef MHGU_NULL_BACKEND
+// ImGui's Vulkan renderer for the window's render pass (under the Vulkan lock); false: no overlay
+static bool backend_ready(const OverlayTarget *t) {
+    if (!g_enabled) return false;
+    g_disp_w = t->width, g_disp_h = t->height;
+    if (g_pass && t->pass != g_pass) {
+        // The window's format changed (HDR turned on or off: its render pass draws into the RGBA16F composition image
+        // instead). Only the pipeline is made again: shutting the backend down freed the textures' descriptor sets
+        // that the frame already built on the game's thread still named, and the game crashed drawing it.
+        ImGui_ImplVulkan_PipelineInfo pi = {};
+        pi.RenderPass = t->pass;
+        pi.Subpass = 0;
+        pi.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+        ImGui_ImplVulkan_CreateMainPipeline(&pi);
+        g_pass = t->pass;
+    }
+    if (t->pass != g_pass) {  // (the window's render pass: the backend made once)
+        ImGui_ImplVulkan_InitInfo info = {};
+        info.ApiVersion = VK_API_VERSION_1_2;
+        info.Instance = t->inst;
+        info.PhysicalDevice = t->phys;
+        info.Device = t->dev;
+        info.QueueFamily = t->qfam;
+        info.Queue = t->queue;
+        info.PipelineCache = t->cache;
+        // One set per ImGui texture: the font atlases (a new texture each time one grows or is repacked, the old one freed
+        // ImageCount frames later; damage numbers at many sizes do that over and over) and the plugins' own. 16 ran out.
+        info.DescriptorPoolSize = 1024;
+        info.MinImageCount = 2;
+        info.ImageCount = 8;  // (vertex buffers in turn: more than the frames ever in flight)
+        info.PipelineInfoMain.RenderPass = t->pass;
+        info.PipelineInfoMain.Subpass = 0;
+        info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+        info.CheckVkResultFn = vk_check;
+        if (!ImGui_ImplVulkan_Init(&info)) {
+            LOG("[forge] ImGui's Vulkan renderer did not start: no overlay\n");
+            g_enabled = false;
+            return false;
+        }
+        g_pass = t->pass;
+        g_dev = t->dev;
+        g_ready = true;
+    }
+    return true;
+}
+#endif
+
+#ifndef MHGU_NULL_BACKEND
+// A frame of its own with only the loading indicator, drawn at once (holding the Vulkan lock and g_frame_lock)
+static void loading_frame(VkCommandBuffer cb, const OverlayTarget *t) {
+    uint64_t now = SDL_GetTicksNS();
+    float scale = frame_setup(ImGui::GetIO(), t->width, t->height, now);
+    ImGui_ImplVulkan_NewFrame();
+    ImGui::NewFrame();
+    draw_loading(now, scale, 1);
+    ImGui::Render();
+    ImDrawData *dd = ImGui::GetDrawData();
+    if (dd->Textures)  // (the font atlas, the first time: the Vulkan lock is held already)
+        for (ImTextureData *tex : *dd->Textures)
+            if (tex->Status != ImTextureStatus_OK) {
+                bool create = tex->Status == ImTextureStatus_WantCreate;
+                ImGui_ImplVulkan_UpdateTexture(tex);
+                if (create && tex->TexID == ImTextureID_Invalid && tex_create_failed(tex)) return;
+            }
+    ImGui_ImplVulkan_RenderDrawData(dd, cb);
+}
+#endif
+
+// (render thread) The game's overlay frame; before the game's thread has made one (its first frame or two), the
+// loading indicator as the loading screen draws it, so it doesn't blink out.
+void overlay_draw(VkCommandBuffer cb, const OverlayTarget *t) {
+#ifndef MHGU_NULL_BACKEND
+    if (!backend_ready(t)) return;
+    {
+        std::unique_lock<std::mutex> frame(g_frame_lock, std::try_to_lock);  // (see overlay_loading)
+        if (frame.owns_lock() && g_config.loading_indicator && !g_loading_t0 && !g_loading_over && g_present_count < 60) {
+            loading_frame(cb, t);
+            return;
+        }
+    }
+    std::lock_guard<std::mutex> l(g_snap_lock);
+    if (g_snap.Valid && g_snap.CmdListsCount) ImGui_ImplVulkan_RenderDrawData(&g_snap, cb);
+#endif
+}
+
+// (the loading screen's thread, holding the Vulkan lock) If the game's thread is building its overlay frame, nothing:
+// its frames have begun, the game's first is near. (Only tried, never waited for: the game's thread takes the Vulkan
+// lock inside its frame, for texture uploads.)
+void overlay_loading(VkCommandBuffer cb, const OverlayTarget *t) {
+#ifndef MHGU_NULL_BACKEND
+    if (!backend_ready(t)) return;
+    std::unique_lock<std::mutex> frame(g_frame_lock, std::try_to_lock);
+    if (frame.owns_lock()) loading_frame(cb, t);
+#else
+    (void)cb, (void)t;
+#endif
+}
