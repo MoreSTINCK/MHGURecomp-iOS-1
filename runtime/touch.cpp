@@ -893,15 +893,13 @@ void edit_event(State &s, const SDL_Event *e, float x, float y) {
                         s.layout.zscale[s.hud_mode][k] = std::clamp(s.layout.zscale[s.hud_mode][k] + delta, .4f, 2.5f);
                         publish_zones(s.layout);
                     }
-                } else if (i == E_HIDE) {
+                } else if (i == E_HIDE) {  // 与 APK 一致：只对 HUD 部件生效（按键不能隐藏，用 Reset 归位）
                     if (s.sel >= ZONE_SEL && s.sel < ZONE_SEL + TZ_COUNT) {
                         int k = s.sel - ZONE_SEL;
                         if (!(s.hud_mode == 0 && k == TZ_ITEM)) {
                             s.layout.zhide[s.hud_mode][k] = !s.layout.zhide[s.hud_mode][k];
                             publish_zones(s.layout);
                         }
-                    } else if (s.sel >= 0 && s.sel < C_COUNT) {
-                        s.layout.x[s.sel] = DEFS[s.sel].x, s.layout.y[s.sel] = DEFS[s.sel].y, s.layout.scale[s.sel] = 1.0f;
                     }
                 } else if (i == E_SET) {
                     g_edit_set = g_edit_set.load() == 1 ? 0 : 1, s.sel = -1;
@@ -916,7 +914,7 @@ void edit_event(State &s, const SDL_Event *e, float x, float y) {
                     } else if (s.sel >= ZONE_SEL && s.sel < ZONE_SEL + TZ_COUNT) {
                         int k = s.sel - ZONE_SEL;
                         s.layout.zx[s.hud_mode][k] = 0.0f, s.layout.zy[s.hud_mode][k] = 0.0f;
-                        s.layout.zscale[s.hud_mode][k] = 1.0f, s.layout.zaspect[s.hud_mode][k] = 0.0f;
+                        s.layout.zscale[s.hud_mode][k] = 1.0f, s.layout.zaspect[s.hud_mode][k] = 1.0f;
                         s.layout.zhide[s.hud_mode][k] = 0;
                         publish_zones(s.layout);
                     } else if (s.sel >= 0 && s.sel < C_COUNT) {
@@ -948,7 +946,7 @@ void edit_event(State &s, const SDL_Event *e, float x, float y) {
             for (int k = 0; k < TZ_COUNT && c < 0; k++)
                 if (zone_rect_edit(z, s.layout, s.hud_mode, k, s.w, s.h).in(x, y)) c = ZONE_SEL + k;
         }
-        if (c < 0 && grab.in(x, y)) { f->kind = F_MENU, s.sel = SEL_PANEL; return; }
+        if (c < 0 && grab.in(x, y)) { f->kind = F_MENU, f->ctl = SEL_PANEL, s.sel = SEL_PANEL; return; }
         if (c < 0 && panel.in(x, y)) { f->kind = F_MENU; return; }
         f->kind = F_EDIT, f->ctl = c;
         s.sel = c;
@@ -959,7 +957,7 @@ void edit_event(State &s, const SDL_Event *e, float x, float y) {
     if (e->type == SDL_EVENT_FINGER_MOTION) {
         float dx = x - f->x, dy = y - f->y;
         f->x = x, f->y = y;
-        if (f->kind == F_MENU && s.sel == SEL_PANEL) { panel_move(dx, dy, s.w, s.h); return; }
+        if (f->kind == F_MENU && f->ctl == SEL_PANEL) { panel_move(dx, dy, s.w, s.h); return; }
         if (f->kind != F_EDIT) return;
         if (s.pinch) {
             Finger *a = nullptr, *b = nullptr;
@@ -2262,8 +2260,7 @@ void draw_editor(ImDrawList *dl, ImFont *font, const State &s, float w, float h)
     float line = .004f * h;
     plate(dl, panel, line, 1.0f, false);
     bool picked = s.sel == SEL_PANEL;
-    text_center(dl, font, .034f * h, ImVec2((panel.x0 + panel.x1) * .5f, panel.y0 + .045f * h), GLOW,
-                picked ? T("Controls and HUD") : T("Controls and HUD"));
+    text_center(dl, font, .034f * h, ImVec2((panel.x0 + panel.x1) * .5f, panel.y0 + .045f * h), GLOW, T("Controls and HUD"));
     if (picked) {  // 面板被选中：右边显示它的大小百分比（与 APK 相同）
         char pct[16];
         snprintf(pct, sizeof pct, "%d%%", (int)lroundf(std::clamp(g_epanel.k, EPANEL_MIN, 1.0f) * 100));
