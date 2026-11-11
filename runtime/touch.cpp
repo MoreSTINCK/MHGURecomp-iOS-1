@@ -468,6 +468,7 @@ std::mutex g_zone_lock;
 Zones g_zones, g_build;  // (g_build: the render thread's alone)
 bool g_build_menu;       // (render thread) a menu window of the game's in this frame
 std::atomic<uint64_t> g_menu_ns;  // when one was last drawn
+std::atomic<uint64_t> g_panel_ns;  // when a big centred panel (the map screen) was last drawn
 // how far each part's art reaches past its pieces' positions, in the game's units (left, top, right, bottom)
 const float MARGIN[TZ_COUNT][4] = {
     {61, 17, 85, 23}, {17, 13, 115, 11}, {30, 26, 30, 13}, {1, 1, 39, 43},
@@ -501,6 +502,9 @@ bool g_window_open, g_window_asked;
 const uint64_t PLAY_HOLD = 4000 * 1000000ull, WINDOW_PRESS = 1500 * 1000000ull, PLAY_NOW = 400 * 1000000ull;
 bool game_menu(void) {
     uint64_t m = g_menu_ns.load(), p = g_play_ns.load(), now = plat_now_ns(), ticks = SDL_GetTicksNS();
+    // 地图界面：一整块盖住大半屏的面板，不是 layer 97/98 的窗口，旧逻辑认不出来，摇杆就一直推着人走
+    uint64_t panel = g_panel_ns.load();
+    if (panel && ticks - panel < 400 * 1000000ull) return true;
     if (m && ticks - m < stale_limit()) {
         if (!g_window_open) g_window_asked = !p || now - p > PLAY_NOW || ticks - g_press_ns.load() < WINDOW_PRESS;
         g_window_open = true;
@@ -1395,6 +1399,7 @@ extern "C" void touch_hud_piece(int zone, float game_x, float game_y, float canv
 }
 
 extern "C" void touch_hud_menu(void) { g_build_menu = true; }
+extern "C" void touch_ui_panel(void) { g_panel_ns = SDL_GetTicksNS(); }
 
 extern "C" void touch_hud_frame(void) {
     if (g_build_menu) g_menu_ns = SDL_GetTicksNS();

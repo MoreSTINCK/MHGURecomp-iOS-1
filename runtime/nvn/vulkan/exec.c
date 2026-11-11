@@ -3341,6 +3341,9 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
 
             if (is_fullscreen && g_hudtrace_active)
                 LOG("[hud] z %.1f pos %.1f,%.1f m %.2f %.2f %.2f %.2f: whole screen, kept\n", pos_z, pos_x, pos_y, m[0], m[1], m[4], m[5]);
+            // 地图界面铺满整屏时就是这种四边形（HUD 图层 100/105），摇杆要让给界面用
+            if (is_fullscreen && !ui_loading_pass && (fabsf(pos_z - 100.0f) < 0.5f || fabsf(pos_z - 105.0f) < 0.5f))
+                touch_ui_panel();
             if (!is_fullscreen) {
                 // The HUD keeps the 16:9 shape it is laid out in: on a wider picture its parts are narrowed (s) and moved
                 // toward their side, on a narrower one (16:10) flattened (sy) and moved toward the top or bottom.
@@ -3599,6 +3602,14 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                             s *= sc, sy *= sc;
                         }
                     }
+                    // 地图界面（不铺满时）：一大块、大致居中的四边形，且不是菜单窗口、过场、结算这些已知界面
+                    if (!ui_stamp_pass && !ui_results_pass && !ui_meownster_pass && !ui_loading_pass &&
+                        !ui_frontend_pass && !ui_title_pass && hud_part < 0 &&
+                        fabsf(pos_z - 97.0f) >= 0.5f && fabsf(pos_z - 98.0f) >= 0.5f &&
+                        fabsf(m[0]) >= 460.0f && fabsf(m[5]) >= 260.0f &&
+                        fabsf(pos_x - 640.0f) <= 80.0f && fabsf(pos_y - 360.0f) <= 160.0f)
+                        touch_ui_panel();
+
                     grouped = sy < 1.0f && !(ui_loading_pass && pos_z >= 94.0f && pos_z < 109.5f) && fabsf(pos_z - 103.0f) >= 0.5f &&
                               fabsf(pos_z - 105.0f) >= 0.5f && pos_y >= 10.0f && pos_y <= 712.0f && !arts_move && !target_move && hud_part < 0;
                     if (s < 1.0f && (fabsf(pos_z - 97.0f) < 0.5f || fabsf(pos_z - 98.0f) < 0.5f || fabsf(pos_z - 100.0f) < 0.5f) &&

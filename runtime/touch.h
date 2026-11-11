@@ -37,6 +37,9 @@ extern volatile int g_pc_zone_hide[TZ_COUNT];
 void touch_hud_piece(int zone, float game_x, float game_y, float canvas_x, float canvas_y);
 void touch_hud_frame(void);
 void touch_hud_menu(void);  // (render thread) a menu window of the game's was drawn this frame: the menu layout
+// 一帧画了一块盖住大半个画面、大致居中的 UI 面板（游戏的地图界面就是这样一整块四边形）：
+// 摇杆这时应当当方向键用（选地图上的目标/翻页），而不是继续推着猎人走。exec.c 里判定。
+void touch_ui_panel(void);
 
 #ifdef __cplusplus
 }
