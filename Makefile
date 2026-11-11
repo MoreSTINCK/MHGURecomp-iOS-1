@@ -273,3 +273,5 @@ clean:  # (keeps $(B)/data, and the settings, caches and saves wherever the game
 	rm -rf $(O) $(B)/*.dll $(B)/*.so $(EXE) $(B)/vkprobe.exe
 
 .PHONY: all gen test-lift runtime-objs clean bundle data licenses FORCE
+
+-include Makefile.port.mk

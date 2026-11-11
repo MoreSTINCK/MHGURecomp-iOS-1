@@ -9,6 +9,7 @@
 #include "config.h"
 #include "mods.h"
 #include "rt.h"
+#include "platform/port_glue.h"
 
 volatile uint64_t g_present_count;
 static SDL_Window *window;
@@ -97,6 +98,7 @@ void ui_init(void) {
 #endif
     if (getenv("MHGU_HIDDEN")) flags |= SDL_WINDOW_HIDDEN;
     window = SDL_CreateWindow("Monster Hunter Generations Ultimate", win_w, win_h, flags);
+    mhgu_port_attach(window);
     if (!window) FATAL("SDL_CreateWindow: %s\n", SDL_GetError());
 #ifndef __APPLE__
     if (g_config.display_mode != DISPLAY_WINDOWED) set_fullscreen(true);
@@ -120,5 +122,6 @@ int ui_run(void) {
         }
         host_input_update();
         cheats_frame();
+        mhgu_port_tick();
     }
 }

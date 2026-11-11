@@ -1,5 +1,9 @@
-// Player settings: mhgurecomp.ini in the game folder (written with the defaults when it is missing).
 #pragma once
+#ifdef __cplusplus
+extern "C" {
+#endif
+// Player settings: mhgurecomp.ini in the game folder (written with the defaults when it is missing).
+
 #include <stdint.h>
 
 enum { DISPLAY_WINDOWED, DISPLAY_FULLSCREEN, DISPLAY_BORDERLESS };
@@ -56,3 +60,7 @@ void config_set_join(const char *join_addr);
 int config_live_combo_window(void);
 void config_window_focus(int focused);
 int config_is_window_focused(void);
+
+#ifdef __cplusplus
+}
+#endif
