@@ -159,7 +159,6 @@ typedef struct {
     char game_dir[512];
     char save_dir[512];
     char save_location[512];
-    int  height;
     int  loading_indicator;
     char ldn_room_host[256], ldn_room_nick[64], ldn_room_pass[64], ldn_room_server[256];
     int  ldn_room_serve, ldn_room_serve_port;
@@ -311,4 +310,14 @@ bool config_confirm_exit(void); // atomic, safe on the host main thread
 
 #ifdef __cplusplus
 }
+#endif
+
+// ---- APK(gu-native) config.c 依赖、iOS 树里分散在别的头文件中的常量 ----
+#ifndef IOS_PORT_CFG_ENUMS
+#define IOS_PORT_CFG_ENUMS
+enum { HDR_TONEMAP_VANILLA, HDR_TONEMAP_NONE, HDR_TONEMAP_RENODRT };
+enum { HDR_GAMMA_SRGB, HDR_GAMMA_22 };
+enum { HDR_FORMAT_AUTO, HDR_FORMAT_10, HDR_FORMAT_16 };
+enum { BATTERY_OFF, BATTERY_ON };
+enum { UPDATES_ASK, UPDATES_OFF, UPDATES_AUTO };
 #endif
