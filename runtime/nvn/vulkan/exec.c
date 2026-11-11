@@ -3481,7 +3481,7 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                             vanchor = V_BOTTOM;
                             ui_relax_scissor = s < 1.0f || sy < 1.0f || (g_touch_hud && hunt_hud);
                             item_bar_part = hunt_hud && pos_y >= 500.0f;
-                            if (item_bar_part) hud_part = TZ_ITEM;
+                            if (item_bar_part) hud_part = HP_ITEMS;
                             if (g_touch_hud && hunt_hud) {
                                 anchor = ANCHOR_CENTER;
                                 item_bar_move = true;
